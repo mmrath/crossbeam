@@ -1,23 +1,28 @@
 //! The channel interface.
 
-use std::fmt;
-use std::iter::FusedIterator;
-use std::mem;
-use std::panic::{RefUnwindSafe, UnwindSafe};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use crate::context::Context;
-use crate::counter;
-use crate::err::{
-    RecvError, RecvTimeoutError, SendError, SendTimeoutError, TryRecvError, TrySendError,
+use alloc::sync::Arc;
+use core::{
+    fmt,
+    iter::FusedIterator,
+    mem,
+    panic::{RefUnwindSafe, UnwindSafe},
+    time::Duration,
 };
-use crate::flavors;
-use crate::select::{Operation, SelectHandle, Token};
+use std::time::Instant;
 
-/// Creates a channel of unbounded capacity.
+use crate::{
+    context::Context,
+    counter,
+    err::{RecvError, RecvTimeoutError, SendError, SendTimeoutError, TryRecvError, TrySendError},
+    flavors,
+    select::{Operation, SelectHandle, Token},
+};
+
+/// Creates a multi-producer multi-consumer channel of unbounded capacity.
 ///
 /// This channel has a growable buffer that can hold any number of messages at a time.
+///
+/// For more info on how to use the channel see [module level documentation](index.html).
 ///
 /// # Examples
 ///
@@ -53,12 +58,14 @@ pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
     (s, r)
 }
 
-/// Creates a channel of bounded capacity.
+/// Creates a multi-producer multi-consumer channel of bounded capacity.
 ///
 /// This channel has a buffer that can hold at most `cap` messages at a time.
 ///
 /// A special case is zero-capacity channel, which cannot hold any messages. Instead, send and
 /// receive operations must appear at the same time in order to pair up and pass the message over.
+///
+/// For more info on how to use the channel see [module level documentation](index.html).
 ///
 /// # Examples
 ///
@@ -151,6 +158,7 @@ pub fn bounded<T>(cap: usize) -> (Sender<T>, Receiver<T>) {
 /// When the message gets sent:
 ///
 /// ```
+/// # if cfg!(gha_macos_runner) { return; } // GitHub-hosted macOS runner is slow
 /// use std::thread;
 /// use std::time::{Duration, Instant};
 /// use crossbeam_channel::after;
@@ -159,7 +167,7 @@ pub fn bounded<T>(cap: usize) -> (Sender<T>, Receiver<T>) {
 /// let ms = |ms| Duration::from_millis(ms);
 ///
 /// // Returns `true` if `a` and `b` are very close `Instant`s.
-/// let eq = |a, b| a + ms(50) > b && b + ms(50) > a;
+/// let eq = |a, b| a + ms(60) > b && b + ms(60) > a;
 ///
 /// let start = Instant::now();
 /// let r = after(ms(100));
@@ -171,8 +179,11 @@ pub fn bounded<T>(cap: usize) -> (Sender<T>, Receiver<T>) {
 /// assert!(eq(Instant::now(), start + ms(500)));
 /// ```
 pub fn after(duration: Duration) -> Receiver<Instant> {
-    Receiver {
-        flavor: ReceiverFlavor::At(Arc::new(flavors::at::Channel::new_timeout(duration))),
+    match Instant::now().checked_add(duration) {
+        Some(deadline) => Receiver {
+            flavor: ReceiverFlavor::At(Arc::new(flavors::at::Channel::new_deadline(deadline))),
+        },
+        None => never(),
     }
 }
 
@@ -232,6 +243,8 @@ pub fn at(when: Instant) -> Receiver<Instant> {
 ///
 /// Using a `never` channel to optionally add a timeout to [`select!`]:
 ///
+/// [`select!`]: crate::select!
+///
 /// ```
 /// use std::thread;
 /// use std::time::Duration;
@@ -239,6 +252,7 @@ pub fn at(when: Instant) -> Receiver<Instant> {
 ///
 /// let (s, r) = unbounded();
 ///
+/// # let t =
 /// thread::spawn(move || {
 ///     thread::sleep(Duration::from_secs(1));
 ///     s.send(1).unwrap();
@@ -249,15 +263,16 @@ pub fn at(when: Instant) -> Receiver<Instant> {
 ///
 /// // Create a channel that times out after the specified duration.
 /// let timeout = duration
-///     .map(|d| after(d))
-///     .unwrap_or(never());
+///     .map(after)
+///     .unwrap_or_else(never);
 ///
 /// select! {
 ///     recv(r) -> msg => assert_eq!(msg, Ok(1)),
 ///     recv(timeout) -> _ => println!("timed out"),
 /// }
+/// # t.join().unwrap(); // join thread to avoid https://github.com/rust-lang/miri/issues/1371
 /// ```
-pub fn never<T>() -> Receiver<T> {
+pub const fn never<T>() -> Receiver<T> {
     Receiver {
         flavor: ReceiverFlavor::Never(flavors::never::Channel::new()),
     }
@@ -289,6 +304,7 @@ pub fn never<T>() -> Receiver<T> {
 /// When messages get sent:
 ///
 /// ```
+/// # if cfg!(gha_macos_runner) { return; } // GitHub-hosted macOS runner is slow
 /// use std::thread;
 /// use std::time::{Duration, Instant};
 /// use crossbeam_channel::tick;
@@ -297,7 +313,7 @@ pub fn never<T>() -> Receiver<T> {
 /// let ms = |ms| Duration::from_millis(ms);
 ///
 /// // Returns `true` if `a` and `b` are very close `Instant`s.
-/// let eq = |a, b| a + ms(50) > b && b + ms(50) > a;
+/// let eq = |a, b| a + ms(65) > b && b + ms(65) > a;
 ///
 /// let start = Instant::now();
 /// let r = tick(ms(100));
@@ -317,8 +333,14 @@ pub fn never<T>() -> Receiver<T> {
 /// assert!(eq(Instant::now(), start + ms(700)));
 /// ```
 pub fn tick(duration: Duration) -> Receiver<Instant> {
-    Receiver {
-        flavor: ReceiverFlavor::Tick(Arc::new(flavors::tick::Channel::new(duration))),
+    match Instant::now().checked_add(duration) {
+        Some(delivery_time) => Receiver {
+            flavor: ReceiverFlavor::Tick(Arc::new(flavors::tick::Channel::new(
+                delivery_time,
+                duration,
+            ))),
+        },
+        None => never(),
     }
 }
 
@@ -471,7 +493,10 @@ impl<T> Sender<T> {
     /// );
     /// ```
     pub fn send_timeout(&self, msg: T, timeout: Duration) -> Result<(), SendTimeoutError<T>> {
-        self.send_deadline(msg, Instant::now() + timeout)
+        match Instant::now().checked_add(timeout) {
+            Some(deadline) => self.send_deadline(msg, deadline),
+            None => self.send(msg).map_err(SendTimeoutError::from),
+        }
     }
 
     /// Waits for a message to be sent into the channel, but only until a given deadline.
@@ -628,12 +653,20 @@ impl<T> Sender<T> {
     /// let (s3, _) = unbounded();
     /// assert!(!s.same_channel(&s3));
     /// ```
-    pub fn same_channel(&self, other: &Sender<T>) -> bool {
+    pub fn same_channel(&self, other: &Self) -> bool {
         match (&self.flavor, &other.flavor) {
             (SenderFlavor::Array(ref a), SenderFlavor::Array(ref b)) => a == b,
             (SenderFlavor::List(ref a), SenderFlavor::List(ref b)) => a == b,
             (SenderFlavor::Zero(ref a), SenderFlavor::Zero(ref b)) => a == b,
             _ => false,
+        }
+    }
+
+    pub(crate) fn addr(&self) -> usize {
+        match &self.flavor {
+            SenderFlavor::Array(a) => a.addr(),
+            SenderFlavor::List(a) => a.addr(),
+            SenderFlavor::Zero(a) => a.addr(),
         }
     }
 }
@@ -658,7 +691,7 @@ impl<T> Clone for Sender<T> {
             SenderFlavor::Zero(chan) => SenderFlavor::Zero(chan.acquire()),
         };
 
-        Sender { flavor }
+        Self { flavor }
     }
 }
 
@@ -861,14 +894,19 @@ impl<T> Receiver<T> {
     /// );
     /// ```
     pub fn recv_timeout(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
-        self.recv_deadline(Instant::now() + timeout)
+        match Instant::now().checked_add(timeout) {
+            Some(deadline) => self.recv_deadline(deadline),
+            None => self.recv().map_err(RecvTimeoutError::from),
+        }
     }
 
     /// Waits for a message to be received from the channel, but only before a given deadline.
     ///
     /// If the channel is empty and not disconnected, this call will block until the receive
     /// operation can proceed or the operation times out. If the channel is empty and becomes
-    /// disconnected, this call will wake up and return an error.
+    /// disconnected, this call will wake up and return an error. If the channel is non-empty
+    /// and the deadline has already been reached, the next message in the channel will be
+    /// returned.
     ///
     /// If called on a zero-capacity channel, this method will wait for a send operation to appear
     /// on the other side of the channel.
@@ -1082,6 +1120,7 @@ impl<T> Receiver<T> {
     ///
     /// let (s, r) = unbounded::<i32>();
     ///
+    /// # let t =
     /// thread::spawn(move || {
     ///     s.send(1).unwrap();
     ///     thread::sleep(Duration::from_secs(1));
@@ -1097,6 +1136,7 @@ impl<T> Receiver<T> {
     /// let v: Vec<_> = r.try_iter().collect();
     ///
     /// assert_eq!(v, [1, 2]);
+    /// # t.join().unwrap(); // join thread to avoid https://github.com/rust-lang/miri/issues/1371
     /// ```
     pub fn try_iter(&self) -> TryIter<'_, T> {
         TryIter { receiver: self }
@@ -1117,7 +1157,7 @@ impl<T> Receiver<T> {
     /// let (_, r3) = unbounded();
     /// assert!(!r.same_channel(&r3));
     /// ```
-    pub fn same_channel(&self, other: &Receiver<T>) -> bool {
+    pub fn same_channel(&self, other: &Self) -> bool {
         match (&self.flavor, &other.flavor) {
             (ReceiverFlavor::Array(a), ReceiverFlavor::Array(b)) => a == b,
             (ReceiverFlavor::List(a), ReceiverFlavor::List(b)) => a == b,
@@ -1126,6 +1166,17 @@ impl<T> Receiver<T> {
             (ReceiverFlavor::Tick(a), ReceiverFlavor::Tick(b)) => Arc::ptr_eq(a, b),
             (ReceiverFlavor::Never(_), ReceiverFlavor::Never(_)) => true,
             _ => false,
+        }
+    }
+
+    pub(crate) fn addr(&self) -> usize {
+        match &self.flavor {
+            ReceiverFlavor::Array(chan) => chan.addr(),
+            ReceiverFlavor::List(chan) => chan.addr(),
+            ReceiverFlavor::Zero(chan) => chan.addr(),
+            ReceiverFlavor::At(chan) => Arc::as_ptr(chan) as usize,
+            ReceiverFlavor::Tick(chan) => Arc::as_ptr(chan) as usize,
+            ReceiverFlavor::Never(_chan) => 0,
         }
     }
 }
@@ -1156,7 +1207,7 @@ impl<T> Clone for Receiver<T> {
             ReceiverFlavor::Never(_) => ReceiverFlavor::Never(flavors::never::Channel::new()),
         };
 
-        Receiver { flavor }
+        Self { flavor }
     }
 }
 
@@ -1248,6 +1299,7 @@ impl<T> fmt::Debug for Iter<'_, T> {
 ///
 /// let (s, r) = unbounded::<i32>();
 ///
+/// # let t =
 /// thread::spawn(move || {
 ///     s.send(1).unwrap();
 ///     thread::sleep(Duration::from_secs(1));
@@ -1263,6 +1315,7 @@ impl<T> fmt::Debug for Iter<'_, T> {
 /// let v: Vec<_> = r.try_iter().collect();
 ///
 /// assert_eq!(v, [1, 2]);
+/// # t.join().unwrap(); // join thread to avoid https://github.com/rust-lang/miri/issues/1371
 /// ```
 pub struct TryIter<'a, T> {
     receiver: &'a Receiver<T>,
@@ -1484,25 +1537,29 @@ impl<T> SelectHandle for Receiver<T> {
 
 /// Writes a message into the channel.
 pub(crate) unsafe fn write<T>(s: &Sender<T>, token: &mut Token, msg: T) -> Result<(), T> {
-    match &s.flavor {
-        SenderFlavor::Array(chan) => chan.write(token, msg),
-        SenderFlavor::List(chan) => chan.write(token, msg),
-        SenderFlavor::Zero(chan) => chan.write(token, msg),
+    unsafe {
+        match &s.flavor {
+            SenderFlavor::Array(chan) => chan.write(token, msg),
+            SenderFlavor::List(chan) => chan.write(token, msg),
+            SenderFlavor::Zero(chan) => chan.write(token, msg),
+        }
     }
 }
 
 /// Reads a message from the channel.
 pub(crate) unsafe fn read<T>(r: &Receiver<T>, token: &mut Token) -> Result<T, ()> {
-    match &r.flavor {
-        ReceiverFlavor::Array(chan) => chan.read(token),
-        ReceiverFlavor::List(chan) => chan.read(token),
-        ReceiverFlavor::Zero(chan) => chan.read(token),
-        ReceiverFlavor::At(chan) => {
-            mem::transmute_copy::<Result<Instant, ()>, Result<T, ()>>(&chan.read(token))
+    unsafe {
+        match &r.flavor {
+            ReceiverFlavor::Array(chan) => chan.read(token),
+            ReceiverFlavor::List(chan) => chan.read(token),
+            ReceiverFlavor::Zero(chan) => chan.read(token),
+            ReceiverFlavor::At(chan) => {
+                mem::transmute_copy::<Result<Instant, ()>, Result<T, ()>>(&chan.read(token))
+            }
+            ReceiverFlavor::Tick(chan) => {
+                mem::transmute_copy::<Result<Instant, ()>, Result<T, ()>>(&chan.read(token))
+            }
+            ReceiverFlavor::Never(chan) => chan.read(token),
         }
-        ReceiverFlavor::Tick(chan) => {
-            mem::transmute_copy::<Result<Instant, ()>, Result<T, ()>>(&chan.read(token))
-        }
-        ReceiverFlavor::Never(chan) => chan.read(token),
     }
 }

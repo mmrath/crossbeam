@@ -4,11 +4,13 @@
 //!   - <http://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue>
 
 use alloc::boxed::Box;
-use core::cell::UnsafeCell;
-use core::fmt;
-use core::marker::PhantomData;
-use core::mem::{self, MaybeUninit};
-use core::sync::atomic::{self, AtomicUsize, Ordering};
+use core::{
+    cell::UnsafeCell,
+    fmt,
+    mem::{self, MaybeUninit},
+    panic::{RefUnwindSafe, UnwindSafe},
+    sync::atomic::{self, AtomicUsize, Ordering},
+};
 
 use crossbeam_utils::{Backoff, CachePadded};
 
@@ -28,9 +30,11 @@ struct Slot<T> {
 ///
 /// This queue allocates a fixed-capacity buffer on construction, which is used to store pushed
 /// elements. The queue cannot hold more elements than the buffer allows. Attempting to push an
-/// element into a full queue will fail. Having a buffer allocated upfront makes this queue a bit
-/// faster than [`SegQueue`].
+/// element into a full queue will fail. Alternatively, [`force_push`] makes it possible for
+/// this queue to be used as a ring-buffer. Having a buffer allocated upfront makes this queue
+/// a bit faster than [`SegQueue`].
 ///
+/// [`force_push`]: ArrayQueue::force_push
 /// [`SegQueue`]: super::SegQueue
 ///
 /// # Examples
@@ -63,20 +67,17 @@ pub struct ArrayQueue<T> {
     tail: CachePadded<AtomicUsize>,
 
     /// The buffer holding slots.
-    buffer: *mut Slot<T>,
-
-    /// The queue capacity.
-    cap: usize,
+    buffer: Box<[Slot<T>]>,
 
     /// A stamp with the value of `{ lap: 1, index: 0 }`.
     one_lap: usize,
-
-    /// Indicates that dropping an `ArrayQueue<T>` may drop elements of type `T`.
-    _marker: PhantomData<T>,
 }
 
 unsafe impl<T: Send> Sync for ArrayQueue<T> {}
 unsafe impl<T: Send> Send for ArrayQueue<T> {}
+
+impl<T> UnwindSafe for ArrayQueue<T> {}
+impl<T> RefUnwindSafe for ArrayQueue<T> {}
 
 impl<T> ArrayQueue<T> {
     /// Creates a new bounded queue with the given capacity.
@@ -92,7 +93,7 @@ impl<T> ArrayQueue<T> {
     ///
     /// let q = ArrayQueue::<i32>::new(100);
     /// ```
-    pub fn new(cap: usize) -> ArrayQueue<T> {
+    pub fn new(cap: usize) -> Self {
         assert!(cap > 0, "capacity must be non-zero");
 
         // Head is initialized to `{ lap: 0, index: 0 }`.
@@ -102,49 +103,31 @@ impl<T> ArrayQueue<T> {
 
         // Allocate a buffer of `cap` slots initialized
         // with stamps.
-        let buffer = {
-            let mut boxed: Box<[Slot<T>]> = (0..cap)
-                .map(|i| {
-                    // Set the stamp to `{ lap: 0, index: i }`.
-                    Slot {
-                        stamp: AtomicUsize::new(i),
-                        value: UnsafeCell::new(MaybeUninit::uninit()),
-                    }
-                })
-                .collect();
-            let ptr = boxed.as_mut_ptr();
-            mem::forget(boxed);
-            ptr
-        };
+        let buffer: Box<[Slot<T>]> = (0..cap)
+            .map(|i| {
+                // Set the stamp to `{ lap: 0, index: i }`.
+                Slot {
+                    stamp: AtomicUsize::new(i),
+                    value: UnsafeCell::new(MaybeUninit::uninit()),
+                }
+            })
+            .collect();
 
         // One lap is the smallest power of two greater than `cap`.
         let one_lap = (cap + 1).next_power_of_two();
 
-        ArrayQueue {
+        Self {
             buffer,
-            cap,
             one_lap,
             head: CachePadded::new(AtomicUsize::new(head)),
             tail: CachePadded::new(AtomicUsize::new(tail)),
-            _marker: PhantomData,
         }
     }
 
-    /// Attempts to push an element into the queue.
-    ///
-    /// If the queue is full, the element is returned back as an error.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use crossbeam_queue::ArrayQueue;
-    ///
-    /// let q = ArrayQueue::new(1);
-    ///
-    /// assert_eq!(q.push(10), Ok(()));
-    /// assert_eq!(q.push(20), Err(20));
-    /// ```
-    pub fn push(&self, value: T) -> Result<(), T> {
+    fn push_or_else<F>(&self, mut value: T, f: F) -> Result<(), T>
+    where
+        F: Fn(T, usize, usize, &Slot<T>) -> Result<T, T>,
+    {
         let backoff = Backoff::new();
         let mut tail = self.tail.load(Ordering::Relaxed);
 
@@ -153,22 +136,23 @@ impl<T> ArrayQueue<T> {
             let index = tail & (self.one_lap - 1);
             let lap = tail & !(self.one_lap - 1);
 
+            let new_tail = if index + 1 < self.capacity() {
+                // Same lap, incremented index.
+                // Set to `{ lap: lap, index: index + 1 }`.
+                tail + 1
+            } else {
+                // One lap forward, index wraps around to zero.
+                // Set to `{ lap: lap.wrapping_add(1), index: 0 }`.
+                lap.wrapping_add(self.one_lap)
+            };
+
             // Inspect the corresponding slot.
-            let slot = unsafe { &*self.buffer.add(index) };
+            debug_assert!(index < self.buffer.len());
+            let slot = unsafe { self.buffer.get_unchecked(index) };
             let stamp = slot.stamp.load(Ordering::Acquire);
 
             // If the tail and the stamp match, we may attempt to push.
             if tail == stamp {
-                let new_tail = if index + 1 < self.cap {
-                    // Same lap, incremented index.
-                    // Set to `{ lap: lap, index: index + 1 }`.
-                    tail + 1
-                } else {
-                    // One lap forward, index wraps around to zero.
-                    // Set to `{ lap: lap.wrapping_add(1), index: 0 }`.
-                    lap.wrapping_add(self.one_lap)
-                };
-
                 // Try moving the tail.
                 match self.tail.compare_exchange_weak(
                     tail,
@@ -191,14 +175,7 @@ impl<T> ArrayQueue<T> {
                 }
             } else if stamp.wrapping_add(self.one_lap) == tail + 1 {
                 atomic::fence(Ordering::SeqCst);
-                let head = self.head.load(Ordering::Relaxed);
-
-                // If the head lags one lap behind the tail as well...
-                if head.wrapping_add(self.one_lap) == tail {
-                    // ...then the queue is full.
-                    return Err(value);
-                }
-
+                value = f(value, tail, new_tail, slot)?;
                 backoff.spin();
                 tail = self.tail.load(Ordering::Relaxed);
             } else {
@@ -207,6 +184,120 @@ impl<T> ArrayQueue<T> {
                 tail = self.tail.load(Ordering::Relaxed);
             }
         }
+    }
+
+    /// Attempts to push an element into the queue.
+    ///
+    /// If the queue is full, the element is returned back as an error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crossbeam_queue::ArrayQueue;
+    ///
+    /// let q = ArrayQueue::new(1);
+    ///
+    /// assert_eq!(q.push(10), Ok(()));
+    /// assert_eq!(q.push(20), Err(20));
+    /// ```
+    pub fn push(&self, value: T) -> Result<(), T> {
+        self.push_or_else(value, |v, tail, _, _| {
+            let head = self.head.load(Ordering::Relaxed);
+
+            // If the head lags one lap behind the tail as well...
+            if head.wrapping_add(self.one_lap) == tail {
+                // ...then the queue is full.
+                Err(v)
+            } else {
+                Ok(v)
+            }
+        })
+    }
+
+    /// Attempts to push an element using an exclusive reference of the queue.
+    ///
+    /// Atomic operations and checks are omitted
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crossbeam_queue::ArrayQueue;
+    ///
+    /// let mut q = ArrayQueue::new(1);
+    ///
+    /// assert_eq!(q.push_mut(10), Ok(()));
+    /// assert_eq!(q.push_mut(20), Err(20));
+    /// ```
+    pub fn push_mut(&mut self, value: T) -> Result<(), T> {
+        let tail = *self.tail.get_mut();
+        let head = *self.head.get_mut();
+
+        if head.wrapping_add(self.one_lap) == tail {
+            return Err(value);
+        }
+
+        let index = tail & (self.one_lap - 1);
+        let lap = tail & !(self.one_lap - 1);
+        let new_tail = if index + 1 < self.capacity() {
+            tail + 1
+        } else {
+            lap.wrapping_add(self.one_lap)
+        };
+
+        *self.tail.get_mut() = new_tail;
+
+        let slot = unsafe { self.buffer.get_unchecked_mut(index) };
+        unsafe {
+            slot.value.get().write(MaybeUninit::new(value));
+        }
+        *slot.stamp.get_mut() = tail + 1;
+
+        Ok(())
+    }
+
+    /// Pushes an element into the queue, replacing the oldest element if necessary.
+    ///
+    /// If the queue is full, the oldest element is replaced and returned,
+    /// otherwise `None` is returned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crossbeam_queue::ArrayQueue;
+    ///
+    /// let q = ArrayQueue::new(2);
+    ///
+    /// assert_eq!(q.force_push(10), None);
+    /// assert_eq!(q.force_push(20), None);
+    /// assert_eq!(q.force_push(30), Some(10));
+    /// assert_eq!(q.pop(), Some(20));
+    /// ```
+    pub fn force_push(&self, value: T) -> Option<T> {
+        self.push_or_else(value, |v, tail, new_tail, slot| {
+            let head = tail.wrapping_sub(self.one_lap);
+            let new_head = new_tail.wrapping_sub(self.one_lap);
+
+            // Try moving the head.
+            if self
+                .head
+                .compare_exchange_weak(head, new_head, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                // Move the tail.
+                self.tail.store(new_tail, Ordering::SeqCst);
+
+                // Swap the previous value.
+                let old = unsafe { slot.value.get().replace(MaybeUninit::new(v)).assume_init() };
+
+                // Update the stamp.
+                slot.stamp.store(tail + 1, Ordering::Release);
+
+                Err(old)
+            } else {
+                Ok(v)
+            }
+        })
+        .err()
     }
 
     /// Attempts to pop an element from the queue.
@@ -234,12 +325,13 @@ impl<T> ArrayQueue<T> {
             let lap = head & !(self.one_lap - 1);
 
             // Inspect the corresponding slot.
-            let slot = unsafe { &*self.buffer.add(index) };
+            debug_assert!(index < self.buffer.len());
+            let slot = unsafe { self.buffer.get_unchecked(index) };
             let stamp = slot.stamp.load(Ordering::Acquire);
 
-            // If the the stamp is ahead of the head by 1, we may attempt to pop.
+            // If the stamp is ahead of the head by 1, we may attempt to pop.
             if head + 1 == stamp {
-                let new = if index + 1 < self.cap {
+                let new = if index + 1 < self.capacity() {
                     // Same lap, incremented index.
                     // Set to `{ lap: lap, index: index + 1 }`.
                     head + 1
@@ -287,6 +379,53 @@ impl<T> ArrayQueue<T> {
         }
     }
 
+    /// Attempts to pop an element using an exclusive reference of the queue.
+    ///
+    /// Due to having an exclusive reference, atomic operations and checks are omitted
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crossbeam_queue::ArrayQueue;
+    ///
+    /// let mut q = ArrayQueue::new(1);
+    /// assert_eq!(q.push(10), Ok(()));
+    ///
+    /// assert_eq!(q.pop_mut(), Some(10));
+    /// assert!(q.pop_mut().is_none());
+    /// ```
+    pub fn pop_mut(&mut self) -> Option<T> {
+        let head = *self.head.get_mut();
+        let tail = *self.tail.get_mut();
+
+        // If the tail equals the head, that means the channel is empty.
+        if tail == head {
+            return None;
+        }
+        let index = head & (self.one_lap - 1);
+        let lap = head & !(self.one_lap - 1);
+
+        // Inspect the corresponding slot.
+        debug_assert!(index < self.buffer.len());
+
+        let new = if index + 1 < self.capacity() {
+            // Same lap, incremented index.
+            // Set to `{ lap: lap, index: index + 1 }`.
+            head + 1
+        } else {
+            // One lap forward, index wraps around to zero.
+            // Set to `{ lap: lap.wrapping_add(1), index: 0 }`.
+            lap.wrapping_add(self.one_lap)
+        };
+
+        let slot = unsafe { self.buffer.get_unchecked_mut(index) };
+
+        let msg = unsafe { slot.value.get().read().assume_init() };
+        *slot.stamp.get_mut() = head.wrapping_add(self.one_lap);
+        *self.head.get_mut() = new;
+        Some(msg)
+    }
+
     /// Returns the capacity of the queue.
     ///
     /// # Examples
@@ -298,8 +437,9 @@ impl<T> ArrayQueue<T> {
     ///
     /// assert_eq!(q.capacity(), 100);
     /// ```
+    #[inline]
     pub fn capacity(&self) -> usize {
-        self.cap
+        self.buffer.len()
     }
 
     /// Returns `true` if the queue is empty.
@@ -381,11 +521,11 @@ impl<T> ArrayQueue<T> {
                 return if hix < tix {
                     tix - hix
                 } else if hix > tix {
-                    self.cap - hix + tix
+                    self.capacity() - hix + tix
                 } else if tail == head {
                     0
                 } else {
-                    self.cap
+                    self.capacity()
                 };
             }
         }
@@ -394,35 +534,39 @@ impl<T> ArrayQueue<T> {
 
 impl<T> Drop for ArrayQueue<T> {
     fn drop(&mut self) {
-        // Get the index of the head.
-        let hix = self.head.load(Ordering::Relaxed) & (self.one_lap - 1);
+        if mem::needs_drop::<T>() {
+            // Get the index of the head.
+            let head = *self.head.get_mut();
+            let tail = *self.tail.get_mut();
 
-        // Loop over all slots that hold a message and drop them.
-        for i in 0..self.len() {
-            // Compute the index of the next slot holding a message.
-            let index = if hix + i < self.cap {
-                hix + i
+            let hix = head & (self.one_lap - 1);
+            let tix = tail & (self.one_lap - 1);
+
+            let len = if hix < tix {
+                tix - hix
+            } else if hix > tix {
+                self.capacity() - hix + tix
+            } else if tail == head {
+                0
             } else {
-                hix + i - self.cap
+                self.capacity()
             };
 
-            unsafe {
-                let p = {
-                    let slot = &mut *self.buffer.add(index);
-                    let value = &mut *slot.value.get();
-                    value.as_mut_ptr()
+            // Loop over all slots that hold a message and drop them.
+            for i in 0..len {
+                // Compute the index of the next slot holding a message.
+                let index = if hix + i < self.capacity() {
+                    hix + i
+                } else {
+                    hix + i - self.capacity()
                 };
-                p.drop_in_place();
-            }
-        }
 
-        // Finally, deallocate the buffer, but don't run any destructors.
-        unsafe {
-            // Create a slice from the buffer to make
-            // a fat pointer. Then, use Box::from_raw
-            // to deallocate it.
-            let ptr = core::slice::from_raw_parts_mut(self.buffer, self.cap) as *mut [Slot<T>];
-            Box::from_raw(ptr);
+                unsafe {
+                    debug_assert!(index < self.buffer.len());
+                    let slot = self.buffer.get_unchecked_mut(index);
+                    (*slot.value.get()).assume_init_drop();
+                }
+            }
         }
     }
 }
@@ -430,5 +574,55 @@ impl<T> Drop for ArrayQueue<T> {
 impl<T> fmt::Debug for ArrayQueue<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad("ArrayQueue { .. }")
+    }
+}
+
+impl<T> IntoIterator for ArrayQueue<T> {
+    type Item = T;
+
+    type IntoIter = IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        IntoIter { value: self }
+    }
+}
+
+#[derive(Debug)]
+pub struct IntoIter<T> {
+    value: ArrayQueue<T>,
+}
+
+impl<T> Iterator for IntoIter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let value = &mut self.value;
+        let head = *value.head.get_mut();
+        if value.head.get_mut() != value.tail.get_mut() {
+            let index = head & (value.one_lap - 1);
+            let lap = head & !(value.one_lap - 1);
+            // SAFETY: We have mutable access to this, so we can read without
+            // worrying about concurrency. Furthermore, we know this is
+            // initialized because it is the value pointed at by `value.head`
+            // and this is a non-empty queue.
+            let val = unsafe {
+                debug_assert!(index < value.buffer.len());
+                let slot = value.buffer.get_unchecked_mut(index);
+                slot.value.get().read().assume_init()
+            };
+            let new = if index + 1 < value.capacity() {
+                // Same lap, incremented index.
+                // Set to `{ lap: lap, index: index + 1 }`.
+                head + 1
+            } else {
+                // One lap forward, index wraps around to zero.
+                // Set to `{ lap: lap.wrapping_add(1), index: 0 }`.
+                lap.wrapping_add(value.one_lap)
+            };
+            *value.head.get_mut() = new;
+            Some(val)
+        } else {
+            None
+        }
     }
 }

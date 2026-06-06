@@ -1,28 +1,22 @@
 #!/bin/bash
-
+set -euxo pipefail
+IFS=$'\n\t'
 cd "$(dirname "$0")"/..
-set -ex
 
-export RUSTFLAGS="-D warnings"
+# shellcheck disable=SC2086
+if [[ -n "${RUST_TARGET:-}" ]]; then
+  cargo test --all --all-features --target "${RUST_TARGET}" --exclude benchmarks ${DOCTEST_XCOMPILE:-} -- --test-threads=1
+  cargo test --all --all-features --target "${RUST_TARGET}" --exclude benchmarks --release ${DOCTEST_XCOMPILE:-} -- --test-threads=1
 
-if [[ -n "$RUST_TARGET" ]]; then
-    # If RUST_TARGET is specified, use cross for testing.
-    cargo install cross
-    cross test --all --target "$RUST_TARGET" --exclude benchmarks -- --test-threads=1
-
-    # For now, the non-host target only runs tests.
-    exit 0
+  # For now, the non-host target only runs tests.
+  exit 0
 fi
 
 # Otherwise, run tests and checks with the host target.
-cargo check --all --bins --examples --tests --exclude benchmarks
-cargo test --all --exclude benchmarks -- --test-threads=1
+cargo test --all --all-features --exclude benchmarks -- --test-threads=1
+cargo test --all --all-features --exclude benchmarks --release -- --test-threads=1
 
-if [[ "$RUST_VERSION" == "nightly"* ]]; then
-    # Some crates have `nightly` feature, so run tests with --all-features.
-    cargo test --all --all-features --exclude benchmarks -- --test-threads=1
-
-    # Benchmarks are only checked on nightly because depending on unstable features.
-    cargo check --all --benches
-    cargo check --bins --manifest-path crossbeam-channel/benchmarks/Cargo.toml
+if [[ "${RUST_VERSION}" == "nightly"* ]]; then
+  # Benchmarks are only checked on nightly because depending on unstable features.
+  cargo check --all --all-features --all-targets
 fi

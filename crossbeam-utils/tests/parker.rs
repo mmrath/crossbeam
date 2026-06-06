@@ -1,16 +1,19 @@
-use std::thread::sleep;
-use std::time::Duration;
-use std::u32;
+use std::{thread::sleep, time::Duration};
 
-use crossbeam_utils::sync::Parker;
-use crossbeam_utils::thread;
+use crossbeam_utils::{
+    sync::{Parker, UnparkReason},
+    thread,
+};
 
 #[test]
 fn park_timeout_unpark_before() {
     let p = Parker::new();
     for _ in 0..10 {
         p.unparker().unpark();
-        p.park_timeout(Duration::from_millis(u32::MAX as u64));
+        assert_eq!(
+            p.park_timeout(Duration::from_millis(u32::MAX as u64)),
+            UnparkReason::Unparked,
+        );
     }
 }
 
@@ -18,7 +21,10 @@ fn park_timeout_unpark_before() {
 fn park_timeout_unpark_not_called() {
     let p = Parker::new();
     for _ in 0..10 {
-        p.park_timeout(Duration::from_millis(10))
+        assert_eq!(
+            p.park_timeout(Duration::from_millis(10)),
+            UnparkReason::Timeout,
+        );
     }
 }
 
@@ -34,7 +40,10 @@ fn park_timeout_unpark_called_other_thread() {
                 u.unpark();
             });
 
-            p.park_timeout(Duration::from_millis(u32::MAX as u64))
+            assert_eq!(
+                p.park_timeout(Duration::from_millis(u32::MAX as u64)),
+                UnparkReason::Unparked,
+            );
         })
         .unwrap();
     }

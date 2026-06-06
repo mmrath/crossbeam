@@ -1,26 +1,38 @@
-use std::sync::atomic::Ordering::SeqCst;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
+};
 
-use crossbeam_deque::Steal::{Empty, Success};
-use crossbeam_deque::{Injector, Worker};
+use crossbeam_deque::{
+    Injector,
+    Steal::{self, Empty, Success},
+    Worker,
+};
 use crossbeam_utils::thread::scope;
-use rand::Rng;
+
+fn busy_retry<T>(mut f: impl FnMut() -> Steal<T>) -> Steal<T> {
+    loop {
+        let s = f();
+        if !s.is_retry() {
+            return s;
+        }
+    }
+}
 
 #[test]
 fn smoke() {
     let q = Injector::new();
-    assert_eq!(q.steal(), Empty);
+    assert_eq!(busy_retry(|| q.steal()), Empty);
 
     q.push(1);
     q.push(2);
-    assert_eq!(q.steal(), Success(1));
-    assert_eq!(q.steal(), Success(2));
-    assert_eq!(q.steal(), Empty);
+    assert_eq!(busy_retry(|| q.steal()), Success(1));
+    assert_eq!(busy_retry(|| q.steal()), Success(2));
+    assert_eq!(busy_retry(|| q.steal()), Empty);
 
     q.push(3);
-    assert_eq!(q.steal(), Success(3));
-    assert_eq!(q.steal(), Empty);
+    assert_eq!(busy_retry(|| q.steal()), Success(3));
+    assert_eq!(busy_retry(|| q.steal()), Empty);
 }
 
 #[test]
@@ -33,20 +45,20 @@ fn is_empty() {
     q.push(2);
     assert!(!q.is_empty());
 
-    let _ = q.steal();
+    let _ = busy_retry(|| q.steal());
     assert!(!q.is_empty());
-    let _ = q.steal();
+    let _ = busy_retry(|| q.steal());
     assert!(q.is_empty());
 
     q.push(3);
     assert!(!q.is_empty());
-    let _ = q.steal();
+    let _ = busy_retry(|| q.steal());
     assert!(q.is_empty());
 }
 
 #[test]
 fn spsc() {
-    const COUNT: usize = 100_000;
+    const COUNT: usize = if cfg!(miri) { 500 } else { 100_000 };
 
     let q = Injector::new();
 
@@ -58,10 +70,12 @@ fn spsc() {
                         assert_eq!(i, v);
                         break;
                     }
+                    #[cfg(miri)]
+                    std::hint::spin_loop();
                 }
             }
 
-            assert_eq!(q.steal(), Empty);
+            assert_eq!(busy_retry(|| q.steal()), Empty);
         });
 
         for i in 0..COUNT {
@@ -73,7 +87,7 @@ fn spsc() {
 
 #[test]
 fn mpmc() {
-    const COUNT: usize = 25_000;
+    const COUNT: usize = if cfg!(miri) { 500 } else { 25_000 };
     const THREADS: usize = 4;
 
     let q = Injector::new();
@@ -96,6 +110,8 @@ fn mpmc() {
                             v[n].fetch_add(1, SeqCst);
                             break;
                         }
+                        #[cfg(miri)]
+                        std::hint::spin_loop();
                     }
                 }
             });
@@ -111,7 +127,7 @@ fn mpmc() {
 #[test]
 fn stampede() {
     const THREADS: usize = 8;
-    const COUNT: usize = 50_000;
+    const COUNT: usize = if cfg!(miri) { 500 } else { 50_000 };
 
     let q = Injector::new();
 
@@ -152,7 +168,11 @@ fn stampede() {
 #[test]
 fn stress() {
     const THREADS: usize = 8;
-    const COUNT: usize = 50_000;
+    const COUNT: usize = if cfg!(miri) { 500 } else { 50_000 };
+
+    if option_env!("MIRI_FALLIBLE_WEAK_CAS").is_some() {
+        return; // see ci/miri.sh
+    }
 
     let q = Injector::new();
     let done = Arc::new(AtomicBool::new(false));
@@ -185,10 +205,10 @@ fn stress() {
             });
         }
 
-        let mut rng = rand::thread_rng();
+        let mut rng = fastrand::Rng::new();
         let mut expected = 0;
         while expected < COUNT {
-            if rng.gen_range(0..3) == 0 {
+            if rng.u8(0..3) == 0 {
                 while let Success(_) = q.steal() {
                     hits.fetch_add(1, SeqCst);
                 }
@@ -208,6 +228,7 @@ fn stress() {
     .unwrap();
 }
 
+#[cfg_attr(miri, ignore)] // Miri is too slow
 #[test]
 fn no_starvation() {
     const THREADS: usize = 8;
@@ -245,11 +266,11 @@ fn no_starvation() {
             });
         }
 
-        let mut rng = rand::thread_rng();
+        let mut rng = fastrand::Rng::new();
         let mut my_hits = 0;
         loop {
-            for i in 0..rng.gen_range(0..COUNT) {
-                if rng.gen_range(0..3) == 0 && my_hits == 0 {
+            for i in 0..rng.usize(0..COUNT) {
+                if rng.u8(0..3) == 0 && my_hits == 0 {
                     while let Success(_) = q.steal() {
                         my_hits += 1;
                     }
@@ -269,9 +290,9 @@ fn no_starvation() {
 
 #[test]
 fn destructors() {
-    const THREADS: usize = 8;
-    const COUNT: usize = 50_000;
-    const STEPS: usize = 1000;
+    const THREADS: usize = if cfg!(miri) { 2 } else { 8 };
+    const COUNT: usize = if cfg!(miri) { 500 } else { 50_000 };
+    const STEPS: usize = if cfg!(miri) { 100 } else { 1000 };
 
     struct Elem(usize, Arc<Mutex<Vec<usize>>>);
 
@@ -341,9 +362,25 @@ fn destructors() {
     {
         let mut v = dropped.lock().unwrap();
         assert_eq!(v.len(), rem);
-        v.sort();
+        v.sort_unstable();
         for pair in v.windows(2) {
             assert_eq!(pair[0] + 1, pair[1]);
         }
     }
+}
+
+// If `Block` is created on the stack, the array of slots will multiply this `BigStruct` and
+// probably overflow the thread stack. It's now directly created on the heap to avoid this.
+#[test]
+fn stack_overflow() {
+    const N: usize = 32_768;
+    struct BigStruct {
+        _data: [u8; N],
+    }
+
+    let q = Injector::new();
+
+    q.push(BigStruct { _data: [0u8; N] });
+
+    while !matches!(q.steal(), Empty) {}
 }

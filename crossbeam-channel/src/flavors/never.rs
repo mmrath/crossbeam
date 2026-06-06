@@ -2,13 +2,15 @@
 //!
 //! Messages cannot be sent into this kind of channel.
 
-use std::marker::PhantomData;
+use core::marker::PhantomData;
 use std::time::Instant;
 
-use crate::context::Context;
-use crate::err::{RecvTimeoutError, TryRecvError};
-use crate::select::{Operation, SelectHandle, Token};
-use crate::utils;
+use crate::{
+    context::Context,
+    err::{RecvTimeoutError, TryRecvError},
+    select::{Operation, SelectHandle, Token},
+    utils,
+};
 
 /// This flavor doesn't need a token.
 pub(crate) type NeverToken = ();
@@ -21,8 +23,8 @@ pub(crate) struct Channel<T> {
 impl<T> Channel<T> {
     /// Creates a channel that never delivers messages.
     #[inline]
-    pub(crate) fn new() -> Self {
-        Channel {
+    pub(crate) const fn new() -> Self {
+        Self {
             _marker: PhantomData,
         }
     }
@@ -65,7 +67,6 @@ impl<T> Channel<T> {
     }
 
     /// Returns the capacity of the channel.
-    #[allow(clippy::unnecessary_wraps)] // This is intentional.
     #[inline]
     pub(crate) fn capacity(&self) -> Option<usize> {
         Some(0)

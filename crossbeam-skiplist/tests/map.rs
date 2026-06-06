@@ -1,4 +1,9 @@
-use std::{iter, ops::Bound, sync::Barrier};
+use std::{
+    borrow::Borrow,
+    iter,
+    ops::Bound,
+    sync::{Arc, Barrier},
+};
 
 use crossbeam_skiplist::SkipMap;
 use crossbeam_utils::thread;
@@ -45,6 +50,48 @@ fn insert() {
 
     for &x in &not_present {
         assert!(s.get(&x).is_none());
+    }
+}
+
+#[test]
+fn compare_and_insert() {
+    let insert = [0, 4, 2, 12, 8, 7, 11, 5];
+    let not_present = [1, 3, 6, 9, 10];
+    let s = SkipMap::new();
+
+    for &x in &insert {
+        s.insert(x, x * 10);
+    }
+
+    for &x in &insert {
+        let value = x * 5;
+        let old_value = *s.get(&x).unwrap().value();
+        s.compare_insert(x, value, |x| x < &value);
+        assert_eq!(*s.get(&x).unwrap().value(), old_value);
+    }
+
+    for &x in &insert {
+        let value = x * 15;
+        s.compare_insert(x, value, |x| x < &value);
+        assert_eq!(*s.get(&x).unwrap().value(), value);
+    }
+
+    for &x in &not_present {
+        assert!(s.get(&x).is_none());
+    }
+}
+
+#[test]
+fn compare_insert_with_absent_key() {
+    let insert = [0, 4, 2, 12, 8, 7, 11, 5];
+    let s = SkipMap::new();
+
+    // The closure will not be called if the key is not present,
+    // so the key-value will be inserted into the map
+    for &x in &insert {
+        let value = x * 15;
+        s.compare_insert(x, value, |_| false);
+        assert_eq!(*s.get(&x).unwrap().value(), value);
     }
 }
 
@@ -101,6 +148,25 @@ fn concurrent_insert() {
         })
         .unwrap();
     }
+}
+
+#[test]
+fn concurrent_compare_and_insert() {
+    let set: SkipMap<i32, i32> = SkipMap::new();
+    let set = std::sync::Arc::new(set);
+    let len = 100;
+    let mut handlers = Vec::with_capacity(len as usize);
+    for i in 0..len {
+        let set = set.clone();
+        let handler = std::thread::spawn(move || {
+            set.compare_insert(1, i, |j| j < &i);
+        });
+        handlers.push(handler);
+    }
+    for handler in handlers {
+        handler.join().unwrap();
+    }
+    assert_eq!(*set.get(&1).unwrap().value(), len - 1);
 }
 
 // https://github.com/crossbeam-rs/crossbeam/issues/672
@@ -858,4 +924,105 @@ fn clear() {
     s.clear();
     assert!(s.is_empty());
     assert_eq!(s.len(), 0);
+}
+
+// https://github.com/crossbeam-rs/crossbeam/issues/1023
+#[test]
+fn concurrent_insert_get_same_key() {
+    let map: Arc<SkipMap<u32, ()>> = Arc::new(SkipMap::new());
+    let len = if cfg!(miri) { 100 } else { 10_000 };
+    let key = 0;
+    map.insert(0, ());
+
+    let getter = map.clone();
+    let handle = std::thread::spawn(move || {
+        for _ in 0..len {
+            map.insert(0, ());
+        }
+    });
+    for _ in 0..len {
+        assert!(getter.get(&key).is_some());
+    }
+    handle.join().unwrap()
+}
+
+// https://github.com/crossbeam-rs/crossbeam/issues/1178
+#[test]
+fn issue_1178() {
+    let map = SkipMap::new();
+    let _ = map.insert(vec![1u8], vec![1u8]);
+    let _ = map.insert(vec![2], vec![2]);
+    let _ = map.insert(vec![3], vec![3]);
+
+    let kvs: Vec<(Vec<u8>, Vec<u8>)> = map
+        .range(vec![1]..vec![3])
+        .map(|e| (e.key().clone(), e.value().clone()))
+        .collect();
+
+    for (k, v) in kvs {
+        map.insert(k, v);
+    }
+}
+
+#[test]
+fn comparator() {
+    use std::cmp::Ordering;
+
+    use crossbeam_skiplist::comparator::{Comparator, Equivalator};
+
+    #[derive(Debug)]
+    struct CaseComparator {
+        case_sensitive: bool,
+    }
+
+    impl<L: Borrow<str> + ?Sized, R: Borrow<str> + ?Sized> Equivalator<L, R> for CaseComparator {
+        fn equivalent(&self, lhs: &L, rhs: &R) -> bool {
+            if self.case_sensitive {
+                lhs.borrow() == rhs.borrow()
+            } else {
+                lhs.borrow()
+                    .chars()
+                    .flat_map(|c| c.to_lowercase())
+                    .eq(rhs.borrow().chars().flat_map(|c| c.to_lowercase()))
+            }
+        }
+    }
+
+    impl<L: Borrow<str> + ?Sized, R: Borrow<str> + ?Sized> Comparator<L, R> for CaseComparator {
+        fn compare(&self, lhs: &L, rhs: &R) -> Ordering {
+            if self.case_sensitive {
+                lhs.borrow().cmp(rhs.borrow())
+            } else {
+                lhs.borrow()
+                    .chars()
+                    .flat_map(|c| c.to_lowercase())
+                    .cmp(rhs.borrow().chars().flat_map(|c| c.to_lowercase()))
+            }
+        }
+    }
+
+    let s: SkipMap<String, u32, _> = SkipMap::with_comparator(CaseComparator {
+        case_sensitive: true,
+    });
+    s.insert("abc".to_owned(), 1);
+    s.insert("ABC".to_owned(), 2);
+    assert_eq!(s.len(), 2);
+    assert_eq!(*s.get("abc").unwrap().value(), 1);
+    assert_eq!(*s.get("ABC").unwrap().value(), 2);
+    assert!(!s.contains_key("aBc"));
+    s.remove("abc");
+    assert!(!s.contains_key("abc"));
+    assert!(s.contains_key("ABC"));
+
+    let s: SkipMap<String, u32, _> = SkipMap::with_comparator(CaseComparator {
+        case_sensitive: false,
+    });
+    s.insert("abc".to_owned(), 1);
+    s.insert("ABC".to_owned(), 2);
+    assert_eq!(s.len(), 1);
+    assert_eq!(*s.get("abc").unwrap().value(), 2);
+    assert_eq!(*s.get("ABC").unwrap().value(), 2);
+    assert_eq!(*s.get("aBc").unwrap().value(), 2);
+    assert_eq!(s.remove("AbC").unwrap().key(), "ABC");
+    assert!(s.is_empty());
 }

@@ -1,9 +1,10 @@
-use crate::primitive::sync::atomic::AtomicUsize;
-use crate::primitive::sync::{Arc, Condvar, Mutex};
-use core::sync::atomic::Ordering::SeqCst;
-use std::fmt;
-use std::marker::PhantomData;
-use std::time::{Duration, Instant};
+use core::{fmt, marker::PhantomData, time::Duration};
+use std::time::Instant;
+
+use crate::primitive::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicUsize, Ordering::SeqCst},
+};
 
 /// A thread parking primitive.
 ///
@@ -37,6 +38,7 @@ use std::time::{Duration, Instant};
 /// // Wakes up immediately and consumes the token.
 /// p.park();
 ///
+/// # let t =
 /// thread::spawn(move || {
 ///     thread::sleep(Duration::from_millis(500));
 ///     u.unpark();
@@ -44,6 +46,7 @@ use std::time::{Duration, Instant};
 ///
 /// // Wakes up when `u.unpark()` provides the token.
 /// p.park();
+/// # t.join().unwrap(); // join thread to avoid https://github.com/rust-lang/miri/issues/1371
 /// ```
 ///
 /// [`park`]: Parker::park
@@ -83,7 +86,7 @@ impl Parker {
     /// let p = Parker::new();
     /// ```
     ///
-    pub fn new() -> Parker {
+    pub fn new() -> Self {
         Self::default()
     }
 
@@ -120,8 +123,14 @@ impl Parker {
     /// // Waits for the token to become available, but will not wait longer than 500 ms.
     /// p.park_timeout(Duration::from_millis(500));
     /// ```
-    pub fn park_timeout(&self, timeout: Duration) {
-        self.park_deadline(Instant::now() + timeout)
+    pub fn park_timeout(&self, timeout: Duration) -> UnparkReason {
+        match Instant::now().checked_add(timeout) {
+            Some(deadline) => self.park_deadline(deadline),
+            None => {
+                self.park();
+                UnparkReason::Unparked
+            }
+        }
     }
 
     /// Blocks the current thread until the token is made available, or until a certain deadline.
@@ -138,7 +147,7 @@ impl Parker {
     /// // Waits for the token to become available, but will not wait longer than 500 ms.
     /// p.park_deadline(deadline);
     /// ```
-    pub fn park_deadline(&self, deadline: Instant) {
+    pub fn park_deadline(&self, deadline: Instant) -> UnparkReason {
         self.unparker.inner.park(Some(deadline))
     }
 
@@ -175,8 +184,9 @@ impl Parker {
     ///
     /// let p = Parker::new();
     /// let raw = Parker::into_raw(p);
+    /// # let _ = unsafe { Parker::from_raw(raw) };
     /// ```
-    pub fn into_raw(this: Parker) -> *const () {
+    pub fn into_raw(this: Self) -> *const () {
         Unparker::into_raw(this.unparker)
     }
 
@@ -195,9 +205,9 @@ impl Parker {
     /// let raw = Parker::into_raw(p);
     /// let p = unsafe { Parker::from_raw(raw) };
     /// ```
-    pub unsafe fn from_raw(ptr: *const ()) -> Parker {
-        Parker {
-            unparker: Unparker::from_raw(ptr),
+    pub unsafe fn from_raw(ptr: *const ()) -> Self {
+        Self {
+            unparker: unsafe { Unparker::from_raw(ptr) },
             _marker: PhantomData,
         }
     }
@@ -233,6 +243,7 @@ impl Unparker {
     /// let p = Parker::new();
     /// let u = p.unparker().clone();
     ///
+    /// # let t =
     /// thread::spawn(move || {
     ///     thread::sleep(Duration::from_millis(500));
     ///     u.unpark();
@@ -240,6 +251,7 @@ impl Unparker {
     ///
     /// // Wakes up when `u.unpark()` provides the token.
     /// p.park();
+    /// # t.join().unwrap(); // join thread to avoid https://github.com/rust-lang/miri/issues/1371
     /// ```
     ///
     /// [`park`]: Parker::park
@@ -258,9 +270,10 @@ impl Unparker {
     /// let p = Parker::new();
     /// let u = p.unparker().clone();
     /// let raw = Unparker::into_raw(u);
+    /// # let _ = unsafe { Unparker::from_raw(raw) };
     /// ```
-    pub fn into_raw(this: Unparker) -> *const () {
-        Arc::into_raw(this.inner) as *const ()
+    pub fn into_raw(this: Self) -> *const () {
+        Arc::into_raw(this.inner).cast::<()>()
     }
 
     /// Converts a raw pointer into an `Unparker`.
@@ -280,9 +293,9 @@ impl Unparker {
     /// let raw = Unparker::into_raw(u);
     /// let u = unsafe { Unparker::from_raw(raw) };
     /// ```
-    pub unsafe fn from_raw(ptr: *const ()) -> Unparker {
-        Unparker {
-            inner: Arc::from_raw(ptr as *const Inner),
+    pub unsafe fn from_raw(ptr: *const ()) -> Self {
+        Self {
+            inner: unsafe { Arc::from_raw(ptr.cast::<Inner>()) },
         }
     }
 }
@@ -294,11 +307,23 @@ impl fmt::Debug for Unparker {
 }
 
 impl Clone for Unparker {
-    fn clone(&self) -> Unparker {
-        Unparker {
+    fn clone(&self) -> Self {
+        Self {
             inner: self.inner.clone(),
         }
     }
+}
+
+/// An enum that reports whether a `Parker::park_timeout` or
+/// `Parker::park_deadline` returned because another thread called `unpark` or
+/// because of a timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnparkReason {
+    /// The park method returned due to a call to `unpark`.
+    Unparked,
+
+    /// The park method returned due to a timeout.
+    Timeout,
 }
 
 const EMPTY: usize = 0;
@@ -312,20 +337,20 @@ struct Inner {
 }
 
 impl Inner {
-    fn park(&self, deadline: Option<Instant>) {
+    fn park(&self, deadline: Option<Instant>) -> UnparkReason {
         // If we were previously notified then we consume this notification and return quickly.
         if self
             .state
             .compare_exchange(NOTIFIED, EMPTY, SeqCst, SeqCst)
             .is_ok()
         {
-            return;
+            return UnparkReason::Unparked;
         }
 
         // If the timeout is zero, then there is no need to actually block.
         if let Some(deadline) = deadline {
             if deadline <= Instant::now() {
-                return;
+                return UnparkReason::Timeout;
             }
         }
 
@@ -343,7 +368,7 @@ impl Inner {
                 // do that we must read from the write it made to `state`.
                 let old = self.state.swap(EMPTY, SeqCst);
                 assert_eq!(old, NOTIFIED, "park state changed unexpectedly");
-                return;
+                return UnparkReason::Unparked;
             }
             Err(n) => panic!("inconsistent park_timeout state: {}", n),
         }
@@ -361,8 +386,9 @@ impl Inner {
                         self.cvar.wait_timeout(m, deadline - now).unwrap().0
                     } else {
                         // We've timed out; swap out the state back to empty on our way out
-                        match self.state.swap(EMPTY, SeqCst) {
-                            NOTIFIED | PARKED => return,
+                        return match self.state.swap(EMPTY, SeqCst) {
+                            NOTIFIED => UnparkReason::Unparked, // got a notification
+                            PARKED => UnparkReason::Timeout,    // no notification
                             n => panic!("inconsistent park_timeout state: {}", n),
                         };
                     }
@@ -375,7 +401,7 @@ impl Inner {
                 .is_ok()
             {
                 // got a notification
-                return;
+                return UnparkReason::Unparked;
             }
 
             // Spurious wakeup, go back to sleep. Alternatively, if we timed out, it will be caught

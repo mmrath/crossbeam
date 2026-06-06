@@ -20,41 +20,44 @@
 //!   - https://github.com/rust-lang/rust/blob/master/COPYRIGHT
 //!   - https://www.rust-lang.org/en-US/legal.html
 
-use std::sync::mpsc::{RecvError, RecvTimeoutError, TryRecvError};
-use std::sync::mpsc::{SendError, TrySendError};
-use std::thread::JoinHandle;
-use std::time::Duration;
+#![allow(clippy::match_single_binding, clippy::redundant_clone)]
+
+use std::{
+    sync::mpsc::{RecvError, RecvTimeoutError, SendError, TryRecvError, TrySendError},
+    thread::JoinHandle,
+    time::Duration,
+};
 
 use crossbeam_channel as cc;
 
-pub struct Sender<T> {
-    pub inner: cc::Sender<T>,
+struct Sender<T> {
+    inner: cc::Sender<T>,
 }
 
 impl<T> Sender<T> {
-    pub fn send(&self, t: T) -> Result<(), SendError<T>> {
+    fn send(&self, t: T) -> Result<(), SendError<T>> {
         self.inner.send(t).map_err(|cc::SendError(m)| SendError(m))
     }
 }
 
 impl<T> Clone for Sender<T> {
-    fn clone(&self) -> Sender<T> {
-        Sender {
+    fn clone(&self) -> Self {
+        Self {
             inner: self.inner.clone(),
         }
     }
 }
 
-pub struct SyncSender<T> {
-    pub inner: cc::Sender<T>,
+struct SyncSender<T> {
+    inner: cc::Sender<T>,
 }
 
 impl<T> SyncSender<T> {
-    pub fn send(&self, t: T) -> Result<(), SendError<T>> {
+    fn send(&self, t: T) -> Result<(), SendError<T>> {
         self.inner.send(t).map_err(|cc::SendError(m)| SendError(m))
     }
 
-    pub fn try_send(&self, t: T) -> Result<(), TrySendError<T>> {
+    fn try_send(&self, t: T) -> Result<(), TrySendError<T>> {
         self.inner.try_send(t).map_err(|err| match err {
             cc::TrySendError::Full(m) => TrySendError::Full(m),
             cc::TrySendError::Disconnected(m) => TrySendError::Disconnected(m),
@@ -63,41 +66,41 @@ impl<T> SyncSender<T> {
 }
 
 impl<T> Clone for SyncSender<T> {
-    fn clone(&self) -> SyncSender<T> {
-        SyncSender {
+    fn clone(&self) -> Self {
+        Self {
             inner: self.inner.clone(),
         }
     }
 }
 
-pub struct Receiver<T> {
-    pub inner: cc::Receiver<T>,
+struct Receiver<T> {
+    inner: cc::Receiver<T>,
 }
 
 impl<T> Receiver<T> {
-    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+    fn try_recv(&self) -> Result<T, TryRecvError> {
         self.inner.try_recv().map_err(|err| match err {
             cc::TryRecvError::Empty => TryRecvError::Empty,
             cc::TryRecvError::Disconnected => TryRecvError::Disconnected,
         })
     }
 
-    pub fn recv(&self) -> Result<T, RecvError> {
+    fn recv(&self) -> Result<T, RecvError> {
         self.inner.recv().map_err(|_| RecvError)
     }
 
-    pub fn recv_timeout(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
+    fn recv_timeout(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
         self.inner.recv_timeout(timeout).map_err(|err| match err {
             cc::RecvTimeoutError::Timeout => RecvTimeoutError::Timeout,
             cc::RecvTimeoutError::Disconnected => RecvTimeoutError::Disconnected,
         })
     }
 
-    pub fn iter(&self) -> Iter<T> {
+    fn iter(&self) -> Iter<'_, T> {
         Iter { inner: self }
     }
 
-    pub fn try_iter(&self) -> TryIter<T> {
+    fn try_iter(&self) -> TryIter<'_, T> {
         TryIter { inner: self }
     }
 }
@@ -106,7 +109,7 @@ impl<'a, T> IntoIterator for &'a Receiver<T> {
     type Item = T;
     type IntoIter = Iter<'a, T>;
 
-    fn into_iter(self) -> Iter<'a, T> {
+    fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
 }
@@ -115,55 +118,55 @@ impl<T> IntoIterator for Receiver<T> {
     type Item = T;
     type IntoIter = IntoIter<T>;
 
-    fn into_iter(self) -> IntoIter<T> {
+    fn into_iter(self) -> Self::IntoIter {
         IntoIter { inner: self }
     }
 }
 
-pub struct TryIter<'a, T: 'a> {
+struct TryIter<'a, T> {
     inner: &'a Receiver<T>,
 }
 
-impl<'a, T> Iterator for TryIter<'a, T> {
+impl<T> Iterator for TryIter<'_, T> {
     type Item = T;
 
-    fn next(&mut self) -> Option<T> {
+    fn next(&mut self) -> Option<Self::Item> {
         self.inner.try_recv().ok()
     }
 }
 
-pub struct Iter<'a, T: 'a> {
+struct Iter<'a, T> {
     inner: &'a Receiver<T>,
 }
 
-impl<'a, T> Iterator for Iter<'a, T> {
+impl<T> Iterator for Iter<'_, T> {
     type Item = T;
 
-    fn next(&mut self) -> Option<T> {
+    fn next(&mut self) -> Option<Self::Item> {
         self.inner.recv().ok()
     }
 }
 
-pub struct IntoIter<T> {
+struct IntoIter<T> {
     inner: Receiver<T>,
 }
 
 impl<T> Iterator for IntoIter<T> {
     type Item = T;
 
-    fn next(&mut self) -> Option<T> {
+    fn next(&mut self) -> Option<Self::Item> {
         self.inner.recv().ok()
     }
 }
 
-pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let (s, r) = cc::unbounded();
     let s = Sender { inner: s };
     let r = Receiver { inner: r };
     (s, r)
 }
 
-pub fn sync_channel<T>(bound: usize) -> (SyncSender<T>, Receiver<T>) {
+fn sync_channel<T>(bound: usize) -> (SyncSender<T>, Receiver<T>) {
     let (s, r) = cc::bounded(bound);
     let s = SyncSender { inner: s };
     let r = Receiver { inner: r };
@@ -174,9 +177,11 @@ macro_rules! select {
     (
         $($name:pat = $rx:ident.$meth:ident() => $code:expr),+
     ) => ({
+        const _IS_BIASED: bool = false;
+
         cc::crossbeam_channel_internal! {
             $(
-                recv(($rx).inner) -> res => {
+                $meth(($rx).inner) -> res => {
                     let $name = res.map_err(|_| ::std::sync::mpsc::RecvError);
                     $code
                 }
@@ -187,13 +192,11 @@ macro_rules! select {
 
 // Source: https://github.com/rust-lang/rust/blob/master/src/libstd/sync/mpsc/mod.rs
 mod channel_tests {
+    use std::{env, thread, time::Instant};
+
     use super::*;
 
-    use std::env;
-    use std::thread;
-    use std::time::{Duration, Instant};
-
-    pub fn stress_factor() -> usize {
+    fn stress_factor() -> usize {
         match env::var("RUST_TEST_STRESS") {
             Ok(val) => val.parse().unwrap(),
             Err(..) => 1,
@@ -314,46 +317,45 @@ mod channel_tests {
 
     #[test]
     fn stress() {
+        const COUNT: usize = if cfg!(miri) { 100 } else { 10000 };
+
         let (tx, rx) = channel::<i32>();
         let t = thread::spawn(move || {
-            for _ in 0..10000 {
+            for _ in 0..COUNT {
                 tx.send(1).unwrap();
             }
         });
-        for _ in 0..10000 {
+        for _ in 0..COUNT {
             assert_eq!(rx.recv().unwrap(), 1);
         }
-        t.join().ok().unwrap();
+        t.join().unwrap();
     }
 
     #[test]
     fn stress_shared() {
-        const AMT: u32 = 10000;
-        const NTHREADS: u32 = 8;
+        let amt: u32 = if cfg!(miri) { 100 } else { 10_000 };
+        let nthreads: u32 = if cfg!(miri) { 4 } else { 8 };
         let (tx, rx) = channel::<i32>();
 
         let t = thread::spawn(move || {
-            for _ in 0..AMT * NTHREADS {
+            for _ in 0..amt * nthreads {
                 assert_eq!(rx.recv().unwrap(), 1);
             }
-            match rx.try_recv() {
-                Ok(..) => panic!(),
-                _ => {}
-            }
+            assert!(rx.try_recv().is_err());
         });
 
-        let mut ts = Vec::with_capacity(NTHREADS as usize);
-        for _ in 0..NTHREADS {
+        let mut ts = Vec::with_capacity(nthreads as usize);
+        for _ in 0..nthreads {
             let tx = tx.clone();
             let t = thread::spawn(move || {
-                for _ in 0..AMT {
+                for _ in 0..amt {
                     tx.send(1).unwrap();
                 }
             });
             ts.push(t);
         }
         drop(tx);
-        t.join().ok().unwrap();
+        t.join().unwrap();
         for t in ts {
             t.join().unwrap();
         }
@@ -375,8 +377,8 @@ mod channel_tests {
                 tx2.send(1).unwrap();
             }
         });
-        t1.join().ok().unwrap();
-        t2.join().ok().unwrap();
+        t1.join().unwrap();
+        t2.join().unwrap();
     }
 
     #[test]
@@ -390,7 +392,7 @@ mod channel_tests {
         for _ in 0..40 {
             tx.send(1).unwrap();
         }
-        t.join().ok().unwrap();
+        t.join().unwrap();
     }
 
     #[test]
@@ -405,8 +407,8 @@ mod channel_tests {
             tx1.send(1).unwrap();
             assert_eq!(rx2.recv().unwrap(), 2);
         });
-        t1.join().ok().unwrap();
-        t2.join().ok().unwrap();
+        t1.join().unwrap();
+        t2.join().unwrap();
     }
 
     #[test]
@@ -735,12 +737,14 @@ mod channel_tests {
 
     #[test]
     fn recv_a_lot() {
+        const N: usize = if cfg!(miri) { 50 } else { 10000 };
+
         // Regression test that we don't run out of stack in scheduler context
         let (tx, rx) = channel();
-        for _ in 0..10000 {
+        for _ in 0..N {
             tx.send(()).unwrap();
         }
-        for _ in 0..10000 {
+        for _ in 0..N {
             rx.recv().unwrap();
         }
     }
@@ -956,13 +960,11 @@ mod channel_tests {
 
 // Source: https://github.com/rust-lang/rust/blob/master/src/libstd/sync/mpsc/mod.rs
 mod sync_channel_tests {
+    use std::{env, thread};
+
     use super::*;
 
-    use std::env;
-    use std::thread;
-    use std::time::Duration;
-
-    pub fn stress_factor() -> usize {
+    fn stress_factor() -> usize {
         match env::var("RUST_TEST_STRESS") {
             Ok(val) => val.parse().unwrap(),
             Err(..) => 1,
@@ -1079,13 +1081,15 @@ mod sync_channel_tests {
 
     #[test]
     fn stress() {
+        const N: usize = if cfg!(miri) { 100 } else { 10000 };
+
         let (tx, rx) = sync_channel::<i32>(0);
         let t = thread::spawn(move || {
-            for _ in 0..10000 {
+            for _ in 0..N {
                 tx.send(1).unwrap();
             }
         });
-        for _ in 0..10000 {
+        for _ in 0..N {
             assert_eq!(rx.recv().unwrap(), 1);
         }
         t.join().unwrap();
@@ -1093,10 +1097,12 @@ mod sync_channel_tests {
 
     #[test]
     fn stress_recv_timeout_two_threads() {
+        const N: usize = if cfg!(miri) { 100 } else { 10000 };
+
         let (tx, rx) = sync_channel::<i32>(0);
 
         let t = thread::spawn(move || {
-            for _ in 0..10000 {
+            for _ in 0..N {
                 tx.send(1).unwrap();
             }
         });
@@ -1113,13 +1119,13 @@ mod sync_channel_tests {
             }
         }
 
-        assert_eq!(recv_count, 10000);
+        assert_eq!(recv_count, N);
         t.join().unwrap();
     }
 
     #[test]
     fn stress_recv_timeout_shared() {
-        const AMT: u32 = 1000;
+        const AMT: u32 = if cfg!(miri) { 100 } else { 1000 };
         const NTHREADS: u32 = 8;
         let (tx, rx) = sync_channel::<i32>(0);
         let (dtx, drx) = sync_channel::<()>(0);
@@ -1165,7 +1171,7 @@ mod sync_channel_tests {
 
     #[test]
     fn stress_shared() {
-        const AMT: u32 = 1000;
+        const AMT: u32 = if cfg!(miri) { 100 } else { 1000 };
         const NTHREADS: u32 = 8;
         let (tx, rx) = sync_channel::<i32>(0);
         let (dtx, drx) = sync_channel::<()>(0);
@@ -1174,10 +1180,7 @@ mod sync_channel_tests {
             for _ in 0..AMT * NTHREADS {
                 assert_eq!(rx.recv().unwrap(), 1);
             }
-            match rx.try_recv() {
-                Ok(..) => panic!(),
-                _ => {}
-            }
+            assert!(rx.try_recv().is_err());
             dtx.send(()).unwrap();
         });
 
@@ -1449,12 +1452,14 @@ mod sync_channel_tests {
 
     #[test]
     fn recv_a_lot() {
+        const N: usize = if cfg!(miri) { 100 } else { 10000 };
+
         // Regression test that we don't run out of stack in scheduler context
-        let (tx, rx) = sync_channel(10000);
-        for _ in 0..10000 {
+        let (tx, rx) = sync_channel(N);
+        for _ in 0..N {
             tx.send(()).unwrap();
         }
-        for _ in 0..10000 {
+        for _ in 0..N {
             rx.recv().unwrap();
         }
     }
@@ -1674,9 +1679,9 @@ mod sync_channel_tests {
 
 // Source: https://github.com/rust-lang/rust/blob/master/src/libstd/sync/mpsc/select.rs
 mod select_tests {
-    use super::*;
-
     use std::thread;
+
+    use super::*;
 
     #[test]
     fn smoke() {
@@ -1792,7 +1797,8 @@ mod select_tests {
 
     #[test]
     fn stress() {
-        const AMT: i32 = 10000;
+        const AMT: i32 = if cfg!(miri) { 100 } else { 10000 };
+
         let (tx1, rx1) = channel::<i32>();
         let (tx2, rx2) = channel::<i32>();
         let (tx3, rx3) = channel::<()>();

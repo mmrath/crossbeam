@@ -91,9 +91,9 @@
 //! A solution to the above is to have the implementation wrap
 //! each value in a lock. However, this has some repercussions:
 //! * The map would no longer be lock-free, inhibiting scalability
-//! and allowing for deadlocks.
+//!   and allowing for deadlocks.
 //! * If a user of the map doesn't need mutable access, then they pay
-//! the price of locks without actually needing them.
+//!   the price of locks without actually needing them.
 //!
 //! Instead, the approach taken by this crate gives more control to the user.
 //! If mutable access is needed, then you can use interior mutability,
@@ -112,7 +112,7 @@
 //!
 //! What happens here? If the map implementation frees the memory
 //! belonging to a value when it is
-//! removed, then a user-after-free occurs, resulting in memory corruption.
+//! removed, then a use-after-free occurs, resulting in memory corruption.
 //!
 //! To solve the above, this crate uses the _epoch-based memory reclamation_ mechanism
 //! implemented in [`crossbeam-epoch`]. Simplified, a value removed from the map
@@ -150,7 +150,7 @@
 //! Crossbeam [does not currently provide a concurrent unordered map](https://github.com/crossbeam-rs/rfcs/issues/32).
 //! That said, here are some other crates which may suit you:
 //! * [`DashMap`](https://docs.rs/dashmap) implements a novel concurrent hash map
-//! with good performance characteristics.
+//!   with good performance characteristics.
 //! * [`flurry`](https://docs.rs/flurry) is a Rust port of Java's `ConcurrentHashMap`.
 //!
 //! [`insert`]: SkipMap::insert
@@ -228,45 +228,42 @@
 //! }
 //! ```
 
+#![no_std]
 #![doc(test(
     no_crate_inject,
-    attr(
-        deny(warnings, rust_2018_idioms),
-        allow(dead_code, unused_assignments, unused_variables)
-    )
+    attr(allow(dead_code, unused_assignments, unused_variables))
 ))]
 #![warn(
     missing_docs,
-    missing_debug_implementations,
-    rust_2018_idioms,
-    unreachable_pub
+    unsafe_op_in_unsafe_fn,
+    clippy::alloc_instead_of_core,
+    clippy::std_instead_of_alloc,
+    clippy::std_instead_of_core
 )]
-#![cfg_attr(not(feature = "std"), no_std)]
 
-use cfg_if::cfg_if;
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
 
-#[cfg(not(crossbeam_no_atomic_cas))]
-cfg_if! {
-    if #[cfg(feature = "alloc")] {
-        extern crate alloc;
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+mod alloc_helper;
 
-        use crossbeam_epoch as epoch;
-        use crossbeam_utils as utils;
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+pub mod base;
 
-        pub mod base;
-        #[doc(inline)]
-        pub use crate::base::SkipList;
-    }
-}
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+#[doc(inline)]
+pub use crate::base::SkipList;
 
-cfg_if! {
-    if #[cfg(feature = "std")] {
-        pub mod map;
-        #[doc(inline)]
-        pub use crate::map::SkipMap;
+#[cfg(feature = "std")]
+pub mod map;
+#[cfg(feature = "std")]
+pub mod set;
 
-        pub mod set;
-        #[doc(inline)]
-        pub use crate::set::SkipSet;
-    }
-}
+#[cfg(feature = "std")]
+#[doc(inline)]
+pub use crate::{map::SkipMap, set::SkipSet};
+
+pub mod comparator;
+pub mod equivalent;

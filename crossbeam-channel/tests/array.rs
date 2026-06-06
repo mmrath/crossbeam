@@ -1,16 +1,17 @@
 //! Tests for the array channel flavor.
 
-use std::any::Any;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-use std::thread;
-use std::time::Duration;
+use std::{
+    any::Any,
+    sync::atomic::{AtomicUsize, Ordering},
+    thread,
+    time::Duration,
+};
 
-use crossbeam_channel::{bounded, select, Receiver};
-use crossbeam_channel::{RecvError, RecvTimeoutError, TryRecvError};
-use crossbeam_channel::{SendError, SendTimeoutError, TrySendError};
+use crossbeam_channel::{
+    Receiver, RecvError, RecvTimeoutError, SendError, SendTimeoutError, TryRecvError, TrySendError,
+    bounded, select,
+};
 use crossbeam_utils::thread::scope;
-use rand::{thread_rng, Rng};
 
 fn ms(ms: u64) -> Duration {
     Duration::from_millis(ms)
@@ -252,8 +253,8 @@ fn recv_after_disconnect() {
 
 #[test]
 fn len() {
-    const COUNT: usize = 25_000;
-    const CAP: usize = 1000;
+    const COUNT: usize = if cfg!(miri) { 50 } else { 25_000 };
+    const CAP: usize = if cfg!(miri) { 50 } else { 1000 };
 
     let (s, r) = bounded(CAP);
 
@@ -345,7 +346,7 @@ fn disconnect_wakes_receiver() {
 
 #[test]
 fn spsc() {
-    const COUNT: usize = 100_000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 100_000 };
 
     let (s, r) = bounded(3);
 
@@ -367,7 +368,7 @@ fn spsc() {
 
 #[test]
 fn mpmc() {
-    const COUNT: usize = 25_000;
+    const COUNT: usize = if cfg!(miri) { 50 } else { 25_000 };
     const THREADS: usize = 4;
 
     let (s, r) = bounded::<usize>(3);
@@ -399,7 +400,7 @@ fn mpmc() {
 
 #[test]
 fn stress_oneshot() {
-    const COUNT: usize = 10_000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 10_000 };
 
     for _ in 0..COUNT {
         let (s, r) = bounded(1);
@@ -414,7 +415,7 @@ fn stress_oneshot() {
 
 #[test]
 fn stress_iter() {
-    const COUNT: usize = 100_000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 100_000 };
 
     let (request_s, request_r) = bounded(1);
     let (response_s, response_r) = bounded(1);
@@ -481,7 +482,8 @@ fn stress_timeout_two_threads() {
 
 #[test]
 fn drops() {
-    const RUNS: usize = 100;
+    const RUNS: usize = if cfg!(miri) { 10 } else { 100 };
+    const STEPS: usize = if cfg!(miri) { 100 } else { 10_000 };
 
     static DROPS: AtomicUsize = AtomicUsize::new(0);
 
@@ -494,11 +496,11 @@ fn drops() {
         }
     }
 
-    let mut rng = thread_rng();
+    let mut rng = fastrand::Rng::new();
 
     for _ in 0..RUNS {
-        let steps = rng.gen_range(0..10_000);
-        let additional = rng.gen_range(0..50);
+        let steps = rng.usize(0..STEPS);
+        let additional = rng.usize(0..50);
 
         DROPS.store(0, Ordering::SeqCst);
         let (s, r) = bounded::<DropCounter>(50);
@@ -531,7 +533,7 @@ fn drops() {
 
 #[test]
 fn linearizable() {
-    const COUNT: usize = 25_000;
+    const COUNT: usize = if cfg!(miri) { 50 } else { 25_000 };
     const THREADS: usize = 4;
 
     let (s, r) = bounded(THREADS);
@@ -551,7 +553,7 @@ fn linearizable() {
 
 #[test]
 fn fairness() {
-    const COUNT: usize = 10_000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 10_000 };
 
     let (s1, r1) = bounded::<()>(COUNT);
     let (s2, r2) = bounded::<()>(COUNT);
@@ -573,7 +575,7 @@ fn fairness() {
 
 #[test]
 fn fairness_duplicates() {
-    const COUNT: usize = 10_000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 10_000 };
 
     let (s, r) = bounded::<()>(COUNT);
 
@@ -599,7 +601,7 @@ fn recv_in_send() {
     let (s, _r) = bounded(1);
     s.send(()).unwrap();
 
-    #[allow(unreachable_code)]
+    #[allow(unreachable_code, clippy::diverging_sub_expression)]
     {
         select! {
             send(s, panic!()) -> _ => panic!(),
@@ -617,7 +619,7 @@ fn recv_in_send() {
 
 #[test]
 fn channel_through_channel() {
-    const COUNT: usize = 1000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 1000 };
 
     type T = Box<dyn Any + Send>;
 
@@ -651,4 +653,57 @@ fn channel_through_channel() {
         });
     })
     .unwrap();
+}
+
+#[test]
+fn panic_on_drop() {
+    struct Msg1<'a>(&'a mut bool);
+    impl Drop for Msg1<'_> {
+        fn drop(&mut self) {
+            if *self.0 && !std::thread::panicking() {
+                panic!("double drop");
+            } else {
+                *self.0 = true;
+            }
+        }
+    }
+
+    struct Msg2<'a>(&'a mut bool);
+    impl Drop for Msg2<'_> {
+        fn drop(&mut self) {
+            if *self.0 {
+                panic!("double drop");
+            } else {
+                *self.0 = true;
+                panic!("first drop");
+            }
+        }
+    }
+
+    // normal
+    let (s, r) = bounded(2);
+    let (mut a, mut b) = (false, false);
+    s.send(Msg1(&mut a)).unwrap();
+    s.send(Msg1(&mut b)).unwrap();
+    drop(s);
+    drop(r);
+    assert!(a);
+    assert!(b);
+
+    // panic on drop
+    let (s, r) = bounded(2);
+    let (mut a, mut b) = (false, false);
+    s.send(Msg2(&mut a)).unwrap();
+    s.send(Msg2(&mut b)).unwrap();
+    drop(s);
+    let res = std::panic::catch_unwind(move || {
+        drop(r);
+    });
+    assert_eq!(
+        *res.unwrap_err().downcast_ref::<&str>().unwrap(),
+        "first drop"
+    );
+    assert!(a);
+    // Elements after the panicked element will leak.
+    assert!(!b);
 }

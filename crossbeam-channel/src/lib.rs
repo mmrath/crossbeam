@@ -273,7 +273,9 @@
 //! let (s1, r1) = unbounded();
 //! let (s2, r2) = unbounded();
 //!
+//! # let t1 =
 //! thread::spawn(move || s1.send(10).unwrap());
+//! # let t2 =
 //! thread::spawn(move || s2.send(20).unwrap());
 //!
 //! // At most one of these two receive operations will be executed.
@@ -282,6 +284,8 @@
 //!     recv(r2) -> msg => assert_eq!(msg, Ok(20)),
 //!     default(Duration::from_secs(1)) => println!("timed out"),
 //! }
+//! # t1.join().unwrap(); // join thread to avoid https://github.com/rust-lang/miri/issues/1371
+//! # t2.join().unwrap(); // join thread to avoid https://github.com/rust-lang/miri/issues/1371
 //! ```
 //!
 //! If you need to select over a dynamically created list of channel operations, use [`Select`]
@@ -321,51 +325,63 @@
 //! [`iter`]: Receiver::iter
 //! [`try_iter`]: Receiver::try_iter
 
+#![no_std]
 #![doc(test(
     no_crate_inject,
-    attr(
-        deny(warnings, rust_2018_idioms),
-        allow(dead_code, unused_assignments, unused_variables)
-    )
+    attr(allow(dead_code, unused_assignments, unused_variables))
 ))]
 #![warn(
     missing_docs,
-    missing_debug_implementations,
-    rust_2018_idioms,
-    unreachable_pub
+    unsafe_op_in_unsafe_fn,
+    clippy::alloc_instead_of_core,
+    clippy::std_instead_of_alloc,
+    clippy::std_instead_of_core
 )]
-#![cfg_attr(not(feature = "std"), no_std)]
 
-use cfg_if::cfg_if;
+#[cfg(feature = "std")]
+extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
 
-cfg_if! {
-    if #[cfg(feature = "std")] {
-        mod channel;
-        mod context;
-        mod counter;
-        mod err;
-        mod flavors;
-        mod select;
-        mod select_macro;
-        mod utils;
-        mod waker;
+#[cfg(feature = "std")]
+mod alloc_helper;
 
-        /// Crate internals used by the `select!` macro.
-        #[doc(hidden)]
-        pub mod internal {
-            pub use crate::select::SelectHandle;
-            pub use crate::select::{select, select_timeout, try_select};
-        }
+#[cfg(feature = "std")]
+mod channel;
+#[cfg(feature = "std")]
+mod context;
+#[cfg(feature = "std")]
+mod counter;
+#[cfg(feature = "std")]
+mod err;
+#[cfg(feature = "std")]
+mod flavors;
+#[cfg(feature = "std")]
+mod select;
+#[cfg(feature = "std")]
+mod select_macro;
+#[cfg(feature = "std")]
+mod utils;
+#[cfg(feature = "std")]
+mod waker;
 
-        pub use crate::channel::{after, at, never, tick};
-        pub use crate::channel::{bounded, unbounded};
-        pub use crate::channel::{IntoIter, Iter, TryIter};
-        pub use crate::channel::{Receiver, Sender};
-
-        pub use crate::select::{Select, SelectedOperation};
-
-        pub use crate::err::{ReadyTimeoutError, SelectTimeoutError, TryReadyError, TrySelectError};
-        pub use crate::err::{RecvError, RecvTimeoutError, TryRecvError};
-        pub use crate::err::{SendError, SendTimeoutError, TrySendError};
-    }
+/// Crate internals used by the `select!` macro.
+#[doc(hidden)]
+#[cfg(feature = "std")]
+pub mod internal {
+    pub use crate::select::{
+        SelectHandle, receiver_addr, select, select_timeout, sender_addr, try_select,
+    };
 }
+
+#[cfg(feature = "std")]
+pub use crate::{
+    channel::{
+        IntoIter, Iter, Receiver, Sender, TryIter, after, at, bounded, never, tick, unbounded,
+    },
+    err::{
+        ReadyTimeoutError, RecvError, RecvTimeoutError, SelectTimeoutError, SendError,
+        SendTimeoutError, TryReadyError, TryRecvError, TrySelectError, TrySendError,
+    },
+    select::{Select, SelectedOperation},
+};

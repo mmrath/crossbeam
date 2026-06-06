@@ -84,7 +84,7 @@
 //! tricky because argument `s` lives *inside* the invocation of `thread::scope()` and as such
 //! cannot be borrowed by scoped threads:
 //!
-//! ```compile_fail,E0373,E0521
+//! ```compile_fail,E0521
 //! use crossbeam_utils::thread;
 //!
 //! thread::scope(|s| {
@@ -111,16 +111,11 @@
 //! }).unwrap();
 //! ```
 
-use std::fmt;
-use std::io;
-use std::marker::PhantomData;
-use std::mem;
-use std::panic;
-use std::sync::{Arc, Mutex};
-use std::thread;
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
+use core::{fmt, marker::PhantomData, mem};
+use std::{io, panic, sync::Mutex, thread};
 
 use crate::sync::WaitGroup;
-use cfg_if::cfg_if;
 
 type SharedVec<T> = Arc<Mutex<Vec<T>>>;
 type SharedOption<T> = Arc<Mutex<Option<T>>>;
@@ -130,7 +125,10 @@ type SharedOption<T> = Arc<Mutex<Option<T>>>;
 /// All child threads that haven't been manually joined will be automatically joined just before
 /// this function invocation ends. If all joined threads have successfully completed, `Ok` is
 /// returned with the return value of `f`. If any of the joined threads has panicked, an `Err` is
-/// returned containing errors from panicked threads.
+/// returned containing errors from panicked threads. Note that if panics are implemented by
+/// aborting the process, no error is returned; see the notes of [std::panic::catch_unwind].
+///
+/// **Note:** Since Rust 1.63, this function is soft-deprecated in favor of the more efficient [`std::thread::scope`].
 ///
 /// # Examples
 ///
@@ -149,6 +147,15 @@ pub fn scope<'env, F, R>(f: F) -> thread::Result<R>
 where
     F: FnOnce(&Scope<'env>) -> R,
 {
+    struct AbortOnPanic;
+    impl Drop for AbortOnPanic {
+        fn drop(&mut self) {
+            if thread::panicking() {
+                std::process::abort();
+            }
+        }
+    }
+
     let wg = WaitGroup::new();
     let scope = Scope::<'env> {
         handles: SharedVec::default(),
@@ -158,6 +165,10 @@ where
 
     // Execute the scoped function, but catch any panics.
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| f(&scope)));
+
+    // If an unwinding panic occurs before all threads are joined
+    // promote it to an aborting panic to prevent any threads from escaping the scope.
+    let guard = AbortOnPanic;
 
     // Wait until all nested scopes are dropped.
     drop(scope.wait_group);
@@ -173,6 +184,8 @@ where
         .filter_map(|handle| handle.lock().unwrap().take())
         .filter_map(|handle| handle.join().err())
         .collect();
+
+    mem::forget(guard);
 
     // If `f` has panicked, resume unwinding.
     // If any of the child threads have panicked, return the panic errors.
@@ -312,6 +325,7 @@ impl fmt::Debug for Scope<'_> {
 /// [`io::Result`]: std::io::Result
 /// [naming-threads]: std::thread#naming-threads
 /// [stack-size]: std::thread#stack-size
+#[must_use = "must eventually spawn the thread"]
 #[derive(Debug)]
 pub struct ScopedThreadBuilder<'scope, 'env> {
     scope: &'scope Scope<'env>,
@@ -340,7 +354,7 @@ impl<'scope, 'env> ScopedThreadBuilder<'scope, 'env> {
     /// ```
     ///
     /// [naming-threads]: std::thread#naming-threads
-    pub fn name(mut self, name: String) -> ScopedThreadBuilder<'scope, 'env> {
+    pub fn name(mut self, name: String) -> Self {
         self.builder = self.builder.name(name);
         self
     }
@@ -365,7 +379,7 @@ impl<'scope, 'env> ScopedThreadBuilder<'scope, 'env> {
     /// ```
     ///
     /// [stack-size]: std::thread#stack-size
-    pub fn stack_size(mut self, size: usize) -> ScopedThreadBuilder<'scope, 'env> {
+    pub fn stack_size(mut self, size: usize) -> Self {
         self.builder = self.builder.stack_size(size);
         self
     }
@@ -480,7 +494,7 @@ pub struct ScopedJoinHandle<'scope, T> {
     /// Holds the result of the inner closure.
     result: SharedOption<T>,
 
-    /// A handle to the the spawned thread.
+    /// A handle to the spawned thread.
     thread: thread::Thread,
 
     /// Borrows the parent scope with lifetime `'scope`.
@@ -490,7 +504,8 @@ pub struct ScopedJoinHandle<'scope, T> {
 impl<T> ScopedJoinHandle<'_, T> {
     /// Waits for the thread to finish and returns its result.
     ///
-    /// If the child thread panics, an error is returned.
+    /// If the child thread panics, an error is returned. Note that if panics are implemented by
+    /// aborting the process, no error is returned; see the notes of [std::panic::catch_unwind].
     ///
     /// # Panics
     ///
@@ -543,37 +558,64 @@ impl<T> ScopedJoinHandle<'_, T> {
     }
 }
 
-cfg_if! {
-    if #[cfg(unix)] {
-        use std::os::unix::thread::{JoinHandleExt, RawPthread};
+/// Unix-specific extensions.
+#[cfg(unix)]
+pub mod unix {
+    use std::os::unix::thread::JoinHandleExt as _;
+    #[doc(no_inline)]
+    pub use std::os::unix::thread::RawPthread;
 
-        impl<T> JoinHandleExt for ScopedJoinHandle<'_, T> {
-            fn as_pthread_t(&self) -> RawPthread {
-                // Borrow the handle. The handle will surely be available because the root scope waits
-                // for nested scopes before joining remaining threads.
-                let handle = self.handle.lock().unwrap();
-                handle.as_ref().unwrap().as_pthread_t()
-            }
-            fn into_pthread_t(self) -> RawPthread {
-                self.as_pthread_t()
-            }
+    use super::ScopedJoinHandle;
+
+    mod sealed {
+        pub trait Sealed {}
+    }
+
+    /// Unix-specific extensions to [`ScopedJoinHandle`].
+    pub trait JoinHandleExt: sealed::Sealed {
+        /// Extracts the raw pthread_t without taking ownership
+        fn as_pthread_t(&self) -> RawPthread;
+
+        /// Consumes the thread, returning the raw pthread_t
+        ///
+        /// This function **transfers ownership** of the underlying pthread_t to
+        /// the caller. Callers are then the unique owners of the pthread_t and
+        /// must either detach or join the pthread_t once it's no longer needed.
+        fn into_pthread_t(self) -> RawPthread;
+    }
+
+    impl<T> sealed::Sealed for ScopedJoinHandle<'_, T> {}
+    impl<T> JoinHandleExt for ScopedJoinHandle<'_, T> {
+        fn as_pthread_t(&self) -> RawPthread {
+            // Borrow the handle. The handle will surely be available because the root scope waits
+            // for nested scopes before joining remaining threads.
+            let handle = self.handle.lock().unwrap();
+            handle.as_ref().unwrap().as_pthread_t()
         }
-    } else if #[cfg(windows)] {
-        use std::os::windows::io::{AsRawHandle, IntoRawHandle, RawHandle};
-
-        impl<T> AsRawHandle for ScopedJoinHandle<'_, T> {
-            fn as_raw_handle(&self) -> RawHandle {
-                // Borrow the handle. The handle will surely be available because the root scope waits
-                // for nested scopes before joining remaining threads.
-                let handle = self.handle.lock().unwrap();
-                handle.as_ref().unwrap().as_raw_handle()
-            }
+        fn into_pthread_t(self) -> RawPthread {
+            self.as_pthread_t()
         }
+    }
+}
+/// Windows-specific extensions.
+#[cfg(windows)]
+mod windows {
+    use std::os::windows::io::{AsRawHandle, IntoRawHandle, RawHandle};
 
-        impl<T> IntoRawHandle for ScopedJoinHandle<'_, T> {
-            fn into_raw_handle(self) -> RawHandle {
-                self.as_raw_handle()
-            }
+    use super::ScopedJoinHandle;
+
+    impl<T> AsRawHandle for ScopedJoinHandle<'_, T> {
+        fn as_raw_handle(&self) -> RawHandle {
+            // Borrow the handle. The handle will surely be available because the root scope waits
+            // for nested scopes before joining remaining threads.
+            let handle = self.handle.lock().unwrap();
+            handle.as_ref().unwrap().as_raw_handle()
+        }
+    }
+
+    impl<T> IntoRawHandle for ScopedJoinHandle<'_, T> {
+        fn into_raw_handle(self) -> RawHandle {
+            self.as_raw_handle()
         }
     }
 }

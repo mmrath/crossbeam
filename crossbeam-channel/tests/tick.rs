@@ -1,11 +1,14 @@
 //! Tests for the tick channel flavor.
 
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-use std::thread;
-use std::time::{Duration, Instant};
+#![cfg(not(miri))] // TODO: many assertions failed due to Miri is slow
 
-use crossbeam_channel::{after, select, tick, Select, TryRecvError};
+use std::{
+    sync::atomic::{AtomicUsize, Ordering},
+    thread,
+    time::{Duration, Instant},
+};
+
+use crossbeam_channel::{Select, TryRecvError, after, select, tick};
 use crossbeam_utils::thread::scope;
 
 fn ms(ms: u64) -> Duration {
@@ -42,6 +45,7 @@ fn fire() {
 }
 
 #[test]
+#[cfg_attr(gha_macos_runner, ignore = "GitHub-hosted macOS runner is slow")]
 fn intervals() {
     let start = Instant::now();
     let r = tick(ms(50));
@@ -95,6 +99,7 @@ fn len_empty_full() {
 }
 
 #[test]
+#[cfg_attr(gha_macos_runner, ignore = "GitHub-hosted macOS runner is slow")]
 fn try_recv() {
     let r = tick(ms(200));
     assert!(r.try_recv().is_err());
@@ -112,6 +117,7 @@ fn try_recv() {
 }
 
 #[test]
+#[cfg_attr(gha_macos_runner, ignore = "GitHub-hosted macOS runner is slow")]
 fn recv() {
     let start = Instant::now();
     let r = tick(ms(50));
@@ -127,8 +133,9 @@ fn recv() {
     assert_eq!(r.try_recv(), Err(TryRecvError::Empty));
 }
 
-#[cfg(not(crossbeam_sanitize))] // TODO: assertions failed due to tsan is slow
 #[test]
+#[cfg_attr(crossbeam_sanitize, ignore)] // TODO: assertions failed due to tsan is slow
+#[cfg_attr(gha_macos_runner, ignore = "GitHub-hosted macOS runner is slow")]
 fn recv_timeout() {
     let start = Instant::now();
     let r = tick(ms(200));
@@ -179,6 +186,7 @@ fn recv_two() {
 }
 
 #[test]
+#[cfg_attr(gha_macos_runner, ignore = "GitHub-hosted macOS runner is slow")]
 fn recv_race() {
     select! {
         recv(tick(ms(50))) -> _ => {}
@@ -211,6 +219,7 @@ fn stress_default() {
 }
 
 #[test]
+#[cfg_attr(gha_macos_runner, ignore = "GitHub-hosted macOS runner is slow")]
 fn select() {
     const THREADS: usize = 4;
 
@@ -252,8 +261,9 @@ fn select() {
     assert_eq!(hits.load(Ordering::SeqCst), 8);
 }
 
-#[cfg(not(crossbeam_sanitize))] // TODO: assertions failed due to tsan is slow
 #[test]
+#[cfg_attr(crossbeam_sanitize, ignore)] // TODO: assertions failed due to tsan is slow
+#[cfg_attr(gha_macos_runner, ignore = "GitHub-hosted macOS runner is slow")]
 fn ready() {
     const THREADS: usize = 4;
 

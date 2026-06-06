@@ -1,10 +1,13 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::channel;
-use std::sync::{Arc, TryLockError};
-use std::thread;
+use std::{
+    sync::{
+        Arc, TryLockError,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::channel,
+    },
+    thread,
+};
 
 use crossbeam_utils::sync::ShardedLock;
-use rand::Rng;
 
 #[derive(Eq, PartialEq, Debug)]
 struct NonCopy(i32);
@@ -21,7 +24,7 @@ fn smoke() {
 #[test]
 fn frob() {
     const N: u32 = 10;
-    const M: usize = 1000;
+    const M: usize = if cfg!(miri) { 50 } else { 1000 };
 
     let r = Arc::new(ShardedLock::new(()));
 
@@ -30,9 +33,9 @@ fn frob() {
         let tx = tx.clone();
         let r = r.clone();
         thread::spawn(move || {
-            let mut rng = rand::thread_rng();
+            let mut rng = fastrand::Rng::new();
             for _ in 0..M {
-                if rng.gen_bool(1.0 / (N as f64)) {
+                if rng.u32(0..N) == 0 {
                     drop(r.write().unwrap());
                 } else {
                     drop(r.read().unwrap());
@@ -138,7 +141,7 @@ fn arc() {
 fn arc_access_in_unwind() {
     let arc = Arc::new(ShardedLock::new(1));
     let arc2 = arc.clone();
-    let _ = thread::spawn(move || {
+    let _: Result<(), _> = thread::spawn(move || {
         struct Unwinder {
             i: Arc<ShardedLock<isize>>,
         }
@@ -211,7 +214,7 @@ fn test_into_inner_drop() {
 fn test_into_inner_poison() {
     let m = Arc::new(ShardedLock::new(NonCopy(10)));
     let m2 = m.clone();
-    let _ = thread::spawn(move || {
+    let _: Result<(), _> = thread::spawn(move || {
         let _lock = m2.write().unwrap();
         panic!("test panic in inner thread to poison ShardedLock");
     })
@@ -235,7 +238,7 @@ fn test_get_mut() {
 fn test_get_mut_poison() {
     let m = Arc::new(ShardedLock::new(NonCopy(10)));
     let m2 = m.clone();
-    let _ = thread::spawn(move || {
+    let _: Result<(), _> = thread::spawn(move || {
         let _lock = m2.write().unwrap();
         panic!("test panic in inner thread to poison ShardedLock");
     })

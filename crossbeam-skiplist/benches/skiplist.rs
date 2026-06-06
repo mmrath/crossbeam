@@ -1,11 +1,11 @@
 #![feature(test)]
+#![allow(clippy::unit_arg)]
 
 extern crate test;
 
-use test::{black_box, Bencher};
-
 use crossbeam_epoch as epoch;
 use crossbeam_skiplist::SkipList;
+use test::{Bencher, black_box};
 
 #[bench]
 fn insert(b: &mut Bencher) {

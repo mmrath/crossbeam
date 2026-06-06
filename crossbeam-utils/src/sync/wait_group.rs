@@ -1,8 +1,9 @@
-// Necessary for using `Mutex<usize>` for conditional variables
-#![allow(clippy::mutex_atomic)]
+use core::{fmt, mem::ManuallyDrop};
 
-use crate::primitive::sync::{Arc, Condvar, Mutex};
-use std::fmt;
+use crate::primitive::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 /// Enables threads to synchronize the beginning or end of some computation.
 ///
@@ -42,6 +43,7 @@ use std::fmt;
 ///
 /// // Block until all threads have finished their work.
 /// wg.wait();
+/// # if cfg!(miri) { std::thread::sleep(std::time::Duration::from_millis(500)); } // wait for background threads closed: https://github.com/rust-lang/miri/issues/1371
 /// ```
 ///
 /// [`Barrier`]: std::sync::Barrier
@@ -52,7 +54,8 @@ pub struct WaitGroup {
 /// Inner state of a `WaitGroup`.
 struct Inner {
     cvar: Condvar,
-    count: Mutex<usize>,
+    lock: Mutex<()>,
+    count: AtomicUsize,
 }
 
 impl Default for WaitGroup {
@@ -60,7 +63,8 @@ impl Default for WaitGroup {
         Self {
             inner: Arc::new(Inner {
                 cvar: Condvar::new(),
-                count: Mutex::new(1),
+                lock: Mutex::new(()),
+                count: AtomicUsize::new(1),
             }),
         }
     }
@@ -90,6 +94,7 @@ impl WaitGroup {
     ///
     /// let wg = WaitGroup::new();
     ///
+    /// # let t =
     /// thread::spawn({
     ///     let wg = wg.clone();
     ///     move || {
@@ -100,39 +105,46 @@ impl WaitGroup {
     ///
     /// // Block until both threads have reached `wait()`.
     /// wg.wait();
+    /// # t.join().unwrap(); // join thread to avoid https://github.com/rust-lang/miri/issues/1371
     /// ```
     pub fn wait(self) {
-        if *self.inner.count.lock().unwrap() == 1 {
+        // SAFETY: this is equivalent to let Self { inner } = self, without calling our Drop.
+        let inner = unsafe {
+            let slf = ManuallyDrop::new(self);
+            core::ptr::read(&slf.inner)
+        };
+
+        if inner.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Acquire lock after updating count, see below.
+            drop(inner.lock.lock().unwrap());
+            inner.cvar.notify_all();
             return;
         }
 
-        let inner = self.inner.clone();
-        drop(self);
-
-        let mut count = inner.count.lock().unwrap();
-        while *count > 0 {
-            count = inner.cvar.wait(count).unwrap();
+        // We check the counter while holding the lock, and notifiers acquire
+        // the lock between updating the counter and notifying, ensuring we
+        // can not miss the notification.
+        let mut guard = inner.lock.lock().unwrap();
+        while inner.count.load(Ordering::Acquire) != 0 {
+            guard = inner.cvar.wait(guard).unwrap();
         }
     }
 }
 
 impl Drop for WaitGroup {
     fn drop(&mut self) {
-        let mut count = self.inner.count.lock().unwrap();
-        *count -= 1;
-
-        if *count == 0 {
+        if self.inner.count.fetch_sub(1, Ordering::Release) == 1 {
+            // Acquire lock after updating count, see wait().
+            drop(self.inner.lock.lock().unwrap());
             self.inner.cvar.notify_all();
         }
     }
 }
 
 impl Clone for WaitGroup {
-    fn clone(&self) -> WaitGroup {
-        let mut count = self.inner.count.lock().unwrap();
-        *count += 1;
-
-        WaitGroup {
+    fn clone(&self) -> Self {
+        self.inner.count.fetch_add(1, Ordering::Relaxed);
+        Self {
             inner: self.inner.clone(),
         }
     }
@@ -140,7 +152,7 @@ impl Clone for WaitGroup {
 
 impl fmt::Debug for WaitGroup {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let count: &usize = &*self.inner.count.lock().unwrap();
-        f.debug_struct("WaitGroup").field("count", count).finish()
+        let count = self.inner.count.load(Ordering::Relaxed);
+        f.debug_struct("WaitGroup").field("count", &count).finish()
     }
 }

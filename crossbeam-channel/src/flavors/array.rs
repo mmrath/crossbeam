@@ -8,19 +8,23 @@
 //!   - <http://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue>
 //!   - <https://docs.google.com/document/d/1yIAYmbvL3JxOKOjuCyon7JhW4cSv1wy5hC0ApeGMV9s/pub>
 
-use std::cell::UnsafeCell;
-use std::marker::PhantomData;
-use std::mem::{self, MaybeUninit};
-use std::ptr;
-use std::sync::atomic::{self, AtomicUsize, Ordering};
+use alloc::boxed::Box;
+use core::{
+    cell::UnsafeCell,
+    mem::{self, MaybeUninit},
+    ptr,
+    sync::atomic::{self, AtomicUsize, Ordering},
+};
 use std::time::Instant;
 
 use crossbeam_utils::{Backoff, CachePadded};
 
-use crate::context::Context;
-use crate::err::{RecvTimeoutError, SendTimeoutError, TryRecvError, TrySendError};
-use crate::select::{Operation, SelectHandle, Selected, Token};
-use crate::waker::SyncWaker;
+use crate::{
+    context::Context,
+    err::{RecvTimeoutError, SendTimeoutError, TryRecvError, TrySendError},
+    select::{Operation, SelectHandle, Selected, Token},
+    waker::SyncWaker,
+};
 
 /// A slot in a channel.
 struct Slot<T> {
@@ -33,7 +37,7 @@ struct Slot<T> {
 
 /// The token type for the array flavor.
 #[derive(Debug)]
-pub struct ArrayToken {
+pub(crate) struct ArrayToken {
     /// Slot to read from or write to.
     slot: *const u8,
 
@@ -44,7 +48,7 @@ pub struct ArrayToken {
 impl Default for ArrayToken {
     #[inline]
     fn default() -> Self {
-        ArrayToken {
+        Self {
             slot: ptr::null(),
             stamp: 0,
         }
@@ -72,10 +76,7 @@ pub(crate) struct Channel<T> {
     tail: CachePadded<AtomicUsize>,
 
     /// The buffer holding slots.
-    buffer: *mut Slot<T>,
-
-    /// The channel capacity.
-    cap: usize,
+    buffer: Box<[Slot<T>]>,
 
     /// A stamp with the value of `{ lap: 1, mark: 0, index: 0 }`.
     one_lap: usize,
@@ -88,9 +89,6 @@ pub(crate) struct Channel<T> {
 
     /// Receivers waiting while the channel is empty and not disconnected.
     receivers: SyncWaker,
-
-    /// Indicates that dropping a `Channel<T>` may drop values of type `T`.
-    _marker: PhantomData<T>,
 }
 
 impl<T> Channel<T> {
@@ -109,31 +107,24 @@ impl<T> Channel<T> {
 
         // Allocate a buffer of `cap` slots initialized
         // with stamps.
-        let buffer = {
-            let mut boxed: Box<[Slot<T>]> = (0..cap)
-                .map(|i| {
-                    // Set the stamp to `{ lap: 0, mark: 0, index: i }`.
-                    Slot {
-                        stamp: AtomicUsize::new(i),
-                        msg: UnsafeCell::new(MaybeUninit::uninit()),
-                    }
-                })
-                .collect();
-            let ptr = boxed.as_mut_ptr();
-            mem::forget(boxed);
-            ptr
-        };
+        let buffer: Box<[Slot<T>]> = (0..cap)
+            .map(|i| {
+                // Set the stamp to `{ lap: 0, mark: 0, index: i }`.
+                Slot {
+                    stamp: AtomicUsize::new(i),
+                    msg: UnsafeCell::new(MaybeUninit::uninit()),
+                }
+            })
+            .collect();
 
-        Channel {
+        Self {
             buffer,
-            cap,
             one_lap,
             mark_bit,
             head: CachePadded::new(AtomicUsize::new(head)),
             tail: CachePadded::new(AtomicUsize::new(tail)),
             senders: SyncWaker::new(),
             receivers: SyncWaker::new(),
-            _marker: PhantomData,
         }
     }
 
@@ -165,12 +156,13 @@ impl<T> Channel<T> {
             let lap = tail & !(self.one_lap - 1);
 
             // Inspect the corresponding slot.
-            let slot = unsafe { &*self.buffer.add(index) };
+            debug_assert!(index < self.buffer.len());
+            let slot = unsafe { self.buffer.get_unchecked(index) };
             let stamp = slot.stamp.load(Ordering::Acquire);
 
             // If the tail and the stamp match, we may attempt to push.
             if tail == stamp {
-                let new_tail = if index + 1 < self.cap {
+                let new_tail = if index + 1 < self.cap() {
                     // Same lap, incremented index.
                     // Set to `{ lap: lap, mark: 0, index: index + 1 }`.
                     tail + 1
@@ -225,10 +217,10 @@ impl<T> Channel<T> {
             return Err(msg);
         }
 
-        let slot: &Slot<T> = &*(token.array.slot as *const Slot<T>);
+        let slot: &Slot<T> = unsafe { &*token.array.slot.cast::<Slot<T>>() };
 
         // Write the message into the slot and update the stamp.
-        slot.msg.get().write(MaybeUninit::new(msg));
+        unsafe { slot.msg.get().write(MaybeUninit::new(msg)) }
         slot.stamp.store(token.array.stamp, Ordering::Release);
 
         // Wake a sleeping receiver.
@@ -247,12 +239,13 @@ impl<T> Channel<T> {
             let lap = head & !(self.one_lap - 1);
 
             // Inspect the corresponding slot.
-            let slot = unsafe { &*self.buffer.add(index) };
+            debug_assert!(index < self.buffer.len());
+            let slot = unsafe { self.buffer.get_unchecked(index) };
             let stamp = slot.stamp.load(Ordering::Acquire);
 
-            // If the the stamp is ahead of the head by 1, we may attempt to pop.
+            // If the stamp is ahead of the head by 1, we may attempt to pop.
             if head + 1 == stamp {
-                let new = if index + 1 < self.cap {
+                let new = if index + 1 < self.cap() {
                     // Same lap, incremented index.
                     // Set to `{ lap: lap, mark: 0, index: index + 1 }`.
                     head + 1
@@ -315,10 +308,10 @@ impl<T> Channel<T> {
             return Err(());
         }
 
-        let slot: &Slot<T> = &*(token.array.slot as *const Slot<T>);
+        let slot: &Slot<T> = unsafe { &*token.array.slot.cast::<Slot<T>>() };
 
         // Read the message from the slot and update the stamp.
-        let msg = slot.msg.get().read().assume_init();
+        let msg = unsafe { slot.msg.get().read().assume_init() };
         slot.stamp.store(token.array.stamp, Ordering::Release);
 
         // Wake a sleeping sender.
@@ -466,20 +459,25 @@ impl<T> Channel<T> {
                 return if hix < tix {
                     tix - hix
                 } else if hix > tix {
-                    self.cap - hix + tix
+                    self.cap() - hix + tix
                 } else if (tail & !self.mark_bit) == head {
                     0
                 } else {
-                    self.cap
+                    self.cap()
                 };
             }
         }
     }
 
     /// Returns the capacity of the channel.
-    #[allow(clippy::unnecessary_wraps)] // This is intentional.
+    #[inline]
+    fn cap(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Returns the capacity of the channel.
     pub(crate) fn capacity(&self) -> Option<usize> {
-        Some(self.cap)
+        Some(self.cap())
     }
 
     /// Disconnects the channel and wakes up all blocked senders and receivers.
@@ -529,35 +527,39 @@ impl<T> Channel<T> {
 
 impl<T> Drop for Channel<T> {
     fn drop(&mut self) {
-        // Get the index of the head.
-        let hix = self.head.load(Ordering::Relaxed) & (self.mark_bit - 1);
+        if mem::needs_drop::<T>() {
+            // Get the index of the head.
+            let head = *self.head.get_mut();
+            let tail = *self.tail.get_mut();
 
-        // Loop over all slots that hold a message and drop them.
-        for i in 0..self.len() {
-            // Compute the index of the next slot holding a message.
-            let index = if hix + i < self.cap {
-                hix + i
+            let hix = head & (self.mark_bit - 1);
+            let tix = tail & (self.mark_bit - 1);
+
+            let len = if hix < tix {
+                tix - hix
+            } else if hix > tix {
+                self.cap() - hix + tix
+            } else if (tail & !self.mark_bit) == head {
+                0
             } else {
-                hix + i - self.cap
+                self.cap()
             };
 
-            unsafe {
-                let p = {
-                    let slot = &mut *self.buffer.add(index);
-                    let msg = &mut *slot.msg.get();
-                    msg.as_mut_ptr()
+            // Loop over all slots that hold a message and drop them.
+            for i in 0..len {
+                // Compute the index of the next slot holding a message.
+                let index = if hix + i < self.cap() {
+                    hix + i
+                } else {
+                    hix + i - self.cap()
                 };
-                p.drop_in_place();
-            }
-        }
 
-        // Finally, deallocate the buffer, but don't run any destructors.
-        unsafe {
-            // Create a slice from the buffer to make
-            // a fat pointer. Then, use Box::from_raw
-            // to deallocate it.
-            let ptr = std::slice::from_raw_parts_mut(self.buffer, self.cap) as *mut [Slot<T>];
-            Box::from_raw(ptr);
+                unsafe {
+                    debug_assert!(index < self.buffer.len());
+                    let slot = self.buffer.get_unchecked_mut(index);
+                    (*slot.msg.get()).assume_init_drop();
+                }
+            }
         }
     }
 }

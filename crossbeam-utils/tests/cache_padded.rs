@@ -1,5 +1,4 @@
-use std::cell::Cell;
-use std::mem;
+use std::{cell::Cell, mem};
 
 use crossbeam_utils::CachePadded;
 
@@ -69,7 +68,7 @@ fn drops() {
 
     struct Foo<'a>(&'a Cell<usize>);
 
-    impl<'a> Drop for Foo<'a> {
+    impl Drop for Foo<'_> {
         fn drop(&mut self) {
             self.0.set(self.0.get() + 1);
         }
@@ -99,10 +98,10 @@ fn runs_custom_clone() {
 
     struct Foo<'a>(&'a Cell<usize>);
 
-    impl<'a> Clone for Foo<'a> {
-        fn clone(&self) -> Foo<'a> {
+    impl Clone for Foo<'_> {
+        fn clone(&self) -> Self {
             self.0.set(self.0.get() + 1);
-            Foo::<'a>(self.0)
+            Self(self.0)
         }
     }
 

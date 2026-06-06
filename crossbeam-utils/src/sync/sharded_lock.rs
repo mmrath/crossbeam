@@ -1,16 +1,22 @@
-use std::cell::UnsafeCell;
-use std::collections::HashMap;
-use std::fmt;
-use std::marker::PhantomData;
-use std::mem;
-use std::ops::{Deref, DerefMut};
-use std::panic::{RefUnwindSafe, UnwindSafe};
-use std::sync::{LockResult, PoisonError, TryLockError, TryLockResult};
-use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::thread::{self, ThreadId};
+use alloc::{boxed::Box, vec::Vec};
+use core::{
+    cell::UnsafeCell,
+    fmt,
+    marker::PhantomData,
+    mem,
+    ops::{Deref, DerefMut},
+    panic::{RefUnwindSafe, UnwindSafe},
+};
+use std::{
+    collections::HashMap,
+    sync::{
+        LockResult, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError,
+        TryLockResult,
+    },
+    thread::{self, ThreadId},
+};
 
-use crate::CachePadded;
-use lazy_static::lazy_static;
+use crate::{CachePadded, sync::once_lock::OnceLock};
 
 /// The number of shards per sharded lock. Must be a power of two.
 const NUM_SHARDS: usize = 8;
@@ -97,8 +103,8 @@ impl<T> ShardedLock<T> {
     ///
     /// let lock = ShardedLock::new(5);
     /// ```
-    pub fn new(value: T) -> ShardedLock<T> {
-        ShardedLock {
+    pub fn new(value: T) -> Self {
+        Self {
             shards: (0..NUM_SHARDS)
                 .map(|_| {
                     CachePadded::new(Shard {
@@ -158,7 +164,7 @@ impl<T: ?Sized> ShardedLock<T> {
     /// let lock = Arc::new(ShardedLock::new(0));
     /// let c_lock = lock.clone();
     ///
-    /// let _ = thread::spawn(move || {
+    /// let _: Result<(), _> = thread::spawn(move || {
     ///     let _lock = c_lock.write().unwrap();
     ///     panic!(); // the lock gets poisoned
     /// }).join();
@@ -356,7 +362,7 @@ impl<T: ?Sized> ShardedLock<T> {
             for shard in self.shards[0..i].iter().rev() {
                 unsafe {
                     let dest: *mut _ = shard.write_guard.get();
-                    let guard = mem::replace(&mut *dest, None);
+                    let guard = (*dest).take();
                     drop(guard);
                 }
             }
@@ -468,18 +474,19 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for ShardedLock<T> {
 }
 
 impl<T: Default> Default for ShardedLock<T> {
-    fn default() -> ShardedLock<T> {
-        ShardedLock::new(Default::default())
+    fn default() -> Self {
+        Self::new(Default::default())
     }
 }
 
 impl<T> From<T> for ShardedLock<T> {
     fn from(t: T) -> Self {
-        ShardedLock::new(t)
+        Self::new(t)
     }
 }
 
 /// A guard used to release the shared read access of a [`ShardedLock`] when dropped.
+#[clippy::has_significant_drop]
 pub struct ShardedLockReadGuard<'a, T: ?Sized> {
     lock: &'a ShardedLock<T>,
     _guard: RwLockReadGuard<'a, ()>,
@@ -511,6 +518,7 @@ impl<T: ?Sized + fmt::Display> fmt::Display for ShardedLockReadGuard<'_, T> {
 }
 
 /// A guard used to release the exclusive write access of a [`ShardedLock`] when dropped.
+#[clippy::has_significant_drop]
 pub struct ShardedLockWriteGuard<'a, T: ?Sized> {
     lock: &'a ShardedLock<T>,
     _marker: PhantomData<RwLockWriteGuard<'a, T>>,
@@ -524,7 +532,7 @@ impl<T: ?Sized> Drop for ShardedLockWriteGuard<'_, T> {
         for shard in self.lock.shards.iter().rev() {
             unsafe {
                 let dest: *mut _ = shard.write_guard.get();
-                let guard = mem::replace(&mut *dest, None);
+                let guard = (*dest).take();
                 drop(guard);
             }
         }
@@ -583,12 +591,16 @@ struct ThreadIndices {
     next_index: usize,
 }
 
-lazy_static! {
-    static ref THREAD_INDICES: Mutex<ThreadIndices> = Mutex::new(ThreadIndices {
-        mapping: HashMap::new(),
-        free_list: Vec::new(),
-        next_index: 0,
-    });
+fn thread_indices() -> &'static Mutex<ThreadIndices> {
+    static THREAD_INDICES: OnceLock<Mutex<ThreadIndices>> = OnceLock::new();
+    fn init() -> Mutex<ThreadIndices> {
+        Mutex::new(ThreadIndices {
+            mapping: HashMap::new(),
+            free_list: Vec::new(),
+            next_index: 0,
+        })
+    }
+    THREAD_INDICES.get_or_init(init)
 }
 
 /// A registration of a thread with an index.
@@ -601,16 +613,16 @@ struct Registration {
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        let mut indices = THREAD_INDICES.lock().unwrap();
+        let mut indices = thread_indices().lock().unwrap();
         indices.mapping.remove(&self.thread_id);
         indices.free_list.push(self.index);
     }
 }
 
-thread_local! {
+std::thread_local! {
     static REGISTRATION: Registration = {
         let thread_id = thread::current().id();
-        let mut indices = THREAD_INDICES.lock().unwrap();
+        let mut indices = thread_indices().lock().unwrap();
 
         let index = match indices.free_list.pop() {
             Some(i) => i,

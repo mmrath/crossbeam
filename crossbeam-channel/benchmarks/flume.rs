@@ -4,8 +4,7 @@ const MESSAGES: usize = 5_000_000;
 const THREADS: usize = 4;
 
 pub fn shuffle<T>(v: &mut [T]) {
-    use std::cell::Cell;
-    use std::num::Wrapping;
+    use std::{cell::Cell, num::Wrapping};
 
     let len = v.len();
     if len <= 1 {
@@ -13,7 +12,7 @@ pub fn shuffle<T>(v: &mut [T]) {
     }
 
     thread_local! {
-        static RNG: Cell<Wrapping<u32>> = Cell::new(Wrapping(1));
+        static RNG: Cell<Wrapping<u32>> = const { Cell::new(Wrapping(1)) };
     }
 
     RNG.with(|rng| {

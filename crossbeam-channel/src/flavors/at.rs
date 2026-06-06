@@ -2,14 +2,15 @@
 //!
 //! Messages cannot be sent into this kind of channel; they are materialized on demand.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
+use core::sync::atomic::{AtomicBool, Ordering};
+use std::{thread, time::Instant};
 
-use crate::context::Context;
-use crate::err::{RecvTimeoutError, TryRecvError};
-use crate::select::{Operation, SelectHandle, Token};
-use crate::utils;
+use crate::{
+    context::Context,
+    err::{RecvTimeoutError, TryRecvError},
+    select::{Operation, SelectHandle, Token},
+    utils,
+};
 
 /// Result of a receive operation.
 pub(crate) type AtToken = Option<Instant>;
@@ -27,15 +28,10 @@ impl Channel {
     /// Creates a channel that delivers a message at a certain instant in time.
     #[inline]
     pub(crate) fn new_deadline(when: Instant) -> Self {
-        Channel {
+        Self {
             delivery_time: when,
             received: AtomicBool::new(false),
         }
-    }
-    /// Creates a channel that delivers a message after a certain duration of time.
-    #[inline]
-    pub(crate) fn new_timeout(dur: Duration) -> Self {
-        Self::new_deadline(Instant::now() + dur)
     }
 
     /// Attempts to receive a message without blocking.
@@ -134,15 +130,10 @@ impl Channel {
     /// Returns the number of messages in the channel.
     #[inline]
     pub(crate) fn len(&self) -> usize {
-        if self.is_empty() {
-            0
-        } else {
-            1
-        }
+        usize::from(!self.is_empty())
     }
 
     /// Returns the capacity of the channel.
-    #[allow(clippy::unnecessary_wraps)] // This is intentional.
     #[inline]
     pub(crate) fn capacity(&self) -> Option<usize> {
         Some(1)

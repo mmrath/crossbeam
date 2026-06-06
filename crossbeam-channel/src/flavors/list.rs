@@ -1,18 +1,25 @@
 //! Unbounded channel implemented as a linked list.
 
-use std::cell::UnsafeCell;
-use std::marker::PhantomData;
-use std::mem::MaybeUninit;
-use std::ptr;
-use std::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
+use alloc::{alloc::handle_alloc_error, boxed::Box};
+use core::{
+    alloc::Layout,
+    cell::UnsafeCell,
+    marker::PhantomData,
+    mem::MaybeUninit,
+    ptr,
+    sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering},
+};
 use std::time::Instant;
 
 use crossbeam_utils::{Backoff, CachePadded};
 
-use crate::context::Context;
-use crate::err::{RecvTimeoutError, SendTimeoutError, TryRecvError, TrySendError};
-use crate::select::{Operation, SelectHandle, Selected, Token};
-use crate::waker::SyncWaker;
+use crate::{
+    alloc_helper::Global,
+    context::Context,
+    err::{RecvTimeoutError, SendTimeoutError, TryRecvError, TrySendError},
+    select::{Operation, SelectHandle, Selected, Token},
+    waker::SyncWaker,
+};
 
 // TODO(stjepang): Once we bump the minimum required Rust version to 1.28 or newer, re-apply the
 // following changes by @kleimkuhler:
@@ -70,19 +77,35 @@ struct Block<T> {
 }
 
 impl<T> Block<T> {
+    const LAYOUT: Layout = {
+        let layout = Layout::new::<Self>();
+        assert!(
+            layout.size() != 0,
+            "Block should never be zero-sized, as it has an AtomicPtr field"
+        );
+        layout
+    };
+
     /// Creates an empty block.
-    fn new() -> Block<T> {
-        // SAFETY: This is safe because:
-        //  [1] `Block::next` (AtomicPtr) may be safely zero initialized.
-        //  [2] `Block::slots` (Array) may be safely zero initialized because of [3, 4].
-        //  [3] `Slot::msg` (UnsafeCell) may be safely zero initialized because it
-        //       holds a MaybeUninit.
-        //  [4] `Slot::state` (AtomicUsize) may be safely zero initialized.
-        unsafe { MaybeUninit::zeroed().assume_init() }
+    fn new() -> Box<Self> {
+        // unsafe { Box::new_zeroed().assume_init() } requires Rust 1.92
+        match Global.allocate_zeroed(Self::LAYOUT) {
+            Some(ptr) => {
+                // SAFETY: This is safe because:
+                //  [1] `Block::next` (AtomicPtr) may be safely zero initialized.
+                //  [2] `Block::slots` (Array) may be safely zero initialized because of [3, 4].
+                //  [3] `Slot::msg` (UnsafeCell) may be safely zero initialized because it
+                //       holds a MaybeUninit.
+                //  [4] `Slot::state` (AtomicUsize) may be safely zero initialized.
+                unsafe { Box::from_raw(ptr.as_ptr().cast()) }
+            }
+            // Handle allocation failure
+            None => handle_alloc_error(Self::LAYOUT),
+        }
     }
 
     /// Waits until the next pointer is set.
-    fn wait_next(&self) -> *mut Block<T> {
+    fn wait_next(&self) -> *mut Self {
         let backoff = Backoff::new();
         loop {
             let next = self.next.load(Ordering::Acquire);
@@ -94,11 +117,11 @@ impl<T> Block<T> {
     }
 
     /// Sets the `DESTROY` bit in slots starting from `start` and destroys the block.
-    unsafe fn destroy(this: *mut Block<T>, start: usize) {
+    unsafe fn destroy(this: *mut Self, start: usize) {
         // It is not necessary to set the `DESTROY` bit in the last slot because that slot has
         // begun destruction of the block.
         for i in start..BLOCK_CAP - 1 {
-            let slot = (*this).slots.get_unchecked(i);
+            let slot = unsafe { (*this).slots.get_unchecked(i) };
 
             // Mark the `DESTROY` bit if a thread is still using the slot.
             if slot.state.load(Ordering::Acquire) & READ == 0
@@ -110,7 +133,7 @@ impl<T> Block<T> {
         }
 
         // No thread is using the block, now it is safe to destroy it.
-        drop(Box::from_raw(this));
+        drop(unsafe { Box::from_raw(this) });
     }
 }
 
@@ -126,7 +149,7 @@ struct Position<T> {
 
 /// The token type for the list flavor.
 #[derive(Debug)]
-pub struct ListToken {
+pub(crate) struct ListToken {
     /// The block of slots.
     block: *const u8,
 
@@ -137,7 +160,7 @@ pub struct ListToken {
 impl Default for ListToken {
     #[inline]
     fn default() -> Self {
-        ListToken {
+        Self {
             block: ptr::null(),
             offset: 0,
         }
@@ -168,7 +191,7 @@ pub(crate) struct Channel<T> {
 impl<T> Channel<T> {
     /// Creates a new unbounded channel.
     pub(crate) fn new() -> Self {
-        Channel {
+        Self {
             head: CachePadded::new(Position {
                 block: AtomicPtr::new(ptr::null_mut()),
                 index: AtomicUsize::new(0),
@@ -220,13 +243,13 @@ impl<T> Channel<T> {
             // If we're going to have to install the next block, allocate it in advance in order to
             // make the wait for other threads as short as possible.
             if offset + 1 == BLOCK_CAP && next_block.is_none() {
-                next_block = Some(Box::new(Block::<T>::new()));
+                next_block = Some(Block::<T>::new());
             }
 
             // If this is the first message to be sent into the channel, we need to allocate the
             // first block and install it.
             if block.is_null() {
-                let new = Box::into_raw(Box::new(Block::<T>::new()));
+                let new = Box::into_raw(Block::<T>::new());
 
                 if self
                     .tail
@@ -283,10 +306,10 @@ impl<T> Channel<T> {
         }
 
         // Write the message into the slot.
-        let block = token.list.block as *mut Block<T>;
+        let block = token.list.block.cast::<Block<T>>();
         let offset = token.list.offset;
-        let slot = (*block).slots.get_unchecked(offset);
-        slot.msg.get().write(MaybeUninit::new(msg));
+        let slot = unsafe { (*block).slots.get_unchecked(offset) };
+        unsafe { slot.msg.get().write(MaybeUninit::new(msg)) }
         slot.state.fetch_or(WRITE, Ordering::Release);
 
         // Wake a sleeping receiver.
@@ -389,16 +412,18 @@ impl<T> Channel<T> {
         // Read the message.
         let block = token.list.block as *mut Block<T>;
         let offset = token.list.offset;
-        let slot = (*block).slots.get_unchecked(offset);
+        let slot = unsafe { (*block).slots.get_unchecked(offset) };
         slot.wait_write();
-        let msg = slot.msg.get().read().assume_init();
+        let msg = unsafe { slot.msg.get().read().assume_init() };
 
         // Destroy the block if we've reached the end, or if another thread wanted to destroy but
         // couldn't because we were busy reading from the slot.
-        if offset + 1 == BLOCK_CAP {
-            Block::destroy(block, 0);
-        } else if slot.state.fetch_or(READ, Ordering::AcqRel) & DESTROY != 0 {
-            Block::destroy(block, offset + 1);
+        unsafe {
+            if offset + 1 == BLOCK_CAP {
+                Block::destroy(block, 0);
+            } else if slot.state.fetch_or(READ, Ordering::AcqRel) & DESTROY != 0 {
+                Block::destroy(block, offset + 1);
+            }
         }
 
         Ok(msg)
@@ -580,7 +605,22 @@ impl<T> Channel<T> {
         }
 
         let mut head = self.head.index.load(Ordering::Acquire);
-        let mut block = self.head.block.load(Ordering::Acquire);
+        // The channel may be uninitialized, so we have to swap to avoid overwriting any sender's attempts
+        // to initialize the first block before noticing that the receivers disconnected. Late allocations
+        // will be deallocated by the sender in Drop
+        let mut block = self.head.block.swap(ptr::null_mut(), Ordering::AcqRel);
+
+        // If we're going to be dropping messages we need to synchronize with initialization
+        if head >> SHIFT != tail >> SHIFT {
+            // The block can be null here only if a sender is in the process of initializing the
+            // channel while another sender managed to send a message by inserting it into the
+            // semi-initialized channel and advanced the tail.
+            // In that case, just wait until it gets initialized.
+            while block.is_null() {
+                backoff.snooze();
+                block = self.head.block.swap(ptr::null_mut(), Ordering::AcqRel);
+            }
+        }
 
         unsafe {
             // Drop all messages between head and tail and deallocate the heap-allocated blocks.
@@ -591,8 +631,7 @@ impl<T> Channel<T> {
                     // Drop the message in the slot.
                     let slot = (*block).slots.get_unchecked(offset);
                     slot.wait_write();
-                    let p = &mut *slot.msg.get();
-                    p.as_mut_ptr().drop_in_place();
+                    (*slot.msg.get()).assume_init_drop();
                 } else {
                     (*block).wait_next();
                     // Deallocate the block and move to the next one.
@@ -610,7 +649,6 @@ impl<T> Channel<T> {
             }
         }
         head &= !MARK_BIT;
-        self.head.block.store(ptr::null_mut(), Ordering::Release);
         self.head.index.store(head, Ordering::Release);
     }
 
@@ -634,9 +672,9 @@ impl<T> Channel<T> {
 
 impl<T> Drop for Channel<T> {
     fn drop(&mut self) {
-        let mut head = self.head.index.load(Ordering::Relaxed);
-        let mut tail = self.tail.index.load(Ordering::Relaxed);
-        let mut block = self.head.block.load(Ordering::Relaxed);
+        let mut head = *self.head.index.get_mut();
+        let mut tail = *self.tail.index.get_mut();
+        let mut block = *self.head.block.get_mut();
 
         // Erase the lower bits.
         head &= !((1 << SHIFT) - 1);
@@ -650,11 +688,10 @@ impl<T> Drop for Channel<T> {
                 if offset < BLOCK_CAP {
                     // Drop the message in the slot.
                     let slot = (*block).slots.get_unchecked(offset);
-                    let p = &mut *slot.msg.get();
-                    p.as_mut_ptr().drop_in_place();
+                    (*slot.msg.get()).assume_init_drop();
                 } else {
                     // Deallocate the block and move to the next one.
-                    let next = (*block).next.load(Ordering::Relaxed);
+                    let next = *(*block).next.get_mut();
                     drop(Box::from_raw(block));
                     block = next;
                 }

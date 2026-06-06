@@ -1,6 +1,6 @@
-use crate::primitive::sync::atomic;
-use core::cell::Cell;
-use core::fmt;
+use core::{cell::Cell, fmt};
+
+use crate::primitive::hint;
 
 const SPIN_LIMIT: u32 = 6;
 const YIELD_LIMIT: u32 = 10;
@@ -93,7 +93,7 @@ impl Backoff {
     /// ```
     #[inline]
     pub fn new() -> Self {
-        Backoff { step: Cell::new(0) }
+        Self { step: Cell::new(0) }
     }
 
     /// Resets the `Backoff`.
@@ -145,10 +145,7 @@ impl Backoff {
     #[inline]
     pub fn spin(&self) {
         for _ in 0..1 << self.step.get().min(SPIN_LIMIT) {
-            // TODO(taiki-e): once we bump the minimum required Rust version to 1.49+,
-            // use [`core::hint::spin_loop`] instead.
-            #[allow(deprecated)]
-            atomic::spin_loop_hint();
+            hint::spin_loop();
         }
 
         if self.step.get() <= SPIN_LIMIT {
@@ -193,6 +190,7 @@ impl Backoff {
     /// let ready = Arc::new(AtomicBool::new(false));
     /// let ready2 = ready.clone();
     ///
+    /// # let t =
     /// thread::spawn(move || {
     ///     thread::sleep(Duration::from_millis(100));
     ///     ready2.store(true, SeqCst);
@@ -201,6 +199,7 @@ impl Backoff {
     /// assert_eq!(ready.load(SeqCst), false);
     /// spin_wait(&ready);
     /// assert_eq!(ready.load(SeqCst), true);
+    /// # t.join().unwrap(); // join thread to avoid https://github.com/rust-lang/miri/issues/1371
     /// ```
     ///
     /// [`AtomicBool`]: std::sync::atomic::AtomicBool
@@ -208,18 +207,12 @@ impl Backoff {
     pub fn snooze(&self) {
         if self.step.get() <= SPIN_LIMIT {
             for _ in 0..1 << self.step.get() {
-                // TODO(taiki-e): once we bump the minimum required Rust version to 1.49+,
-                // use [`core::hint::spin_loop`] instead.
-                #[allow(deprecated)]
-                atomic::spin_loop_hint();
+                hint::spin_loop();
             }
         } else {
             #[cfg(not(feature = "std"))]
             for _ in 0..1 << self.step.get() {
-                // TODO(taiki-e): once we bump the minimum required Rust version to 1.49+,
-                // use [`core::hint::spin_loop`] instead.
-                #[allow(deprecated)]
-                atomic::spin_loop_hint();
+                hint::spin_loop();
             }
 
             #[cfg(feature = "std")]
@@ -260,6 +253,7 @@ impl Backoff {
     /// let ready2 = ready.clone();
     /// let waiter = thread::current();
     ///
+    /// # let t =
     /// thread::spawn(move || {
     ///     thread::sleep(Duration::from_millis(100));
     ///     ready2.store(true, SeqCst);
@@ -269,6 +263,7 @@ impl Backoff {
     /// assert_eq!(ready.load(SeqCst), false);
     /// blocking_wait(&ready);
     /// assert_eq!(ready.load(SeqCst), true);
+    /// # t.join().unwrap(); // join thread to avoid https://github.com/rust-lang/miri/issues/1371
     /// ```
     ///
     /// [`AtomicBool`]: std::sync::atomic::AtomicBool
@@ -288,7 +283,7 @@ impl fmt::Debug for Backoff {
 }
 
 impl Default for Backoff {
-    fn default() -> Backoff {
-        Backoff::new()
+    fn default() -> Self {
+        Self::new()
     }
 }

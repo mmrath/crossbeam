@@ -1,6 +1,4 @@
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
+use std::{sync::mpsc, thread, time::Duration};
 
 use crossbeam_utils::sync::WaitGroup;
 
@@ -38,22 +36,25 @@ fn wait() {
 #[test]
 fn wait_and_drop() {
     let wg = WaitGroup::new();
+    let wg2 = WaitGroup::new();
     let (tx, rx) = mpsc::channel();
 
     for _ in 0..THREADS {
         let wg = wg.clone();
+        let wg2 = wg2.clone();
         let tx = tx.clone();
 
         thread::spawn(move || {
-            thread::sleep(Duration::from_millis(100));
+            wg2.wait();
             tx.send(()).unwrap();
             drop(wg);
         });
     }
 
-    // At this point, all spawned threads should be sleeping, so we shouldn't get anything from the
+    // At this point, no thread has gotten past `wg2.wait()`, so we shouldn't get anything from the
     // channel.
     assert!(rx.try_recv().is_err());
+    drop(wg2);
 
     wg.wait();
 

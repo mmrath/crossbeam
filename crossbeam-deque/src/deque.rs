@@ -1,15 +1,18 @@
-use std::cell::{Cell, UnsafeCell};
-use std::cmp;
-use std::fmt;
-use std::iter::FromIterator;
-use std::marker::PhantomData;
-use std::mem::{self, MaybeUninit};
-use std::ptr;
-use std::sync::atomic::{self, AtomicIsize, AtomicPtr, AtomicUsize, Ordering};
-use std::sync::Arc;
+use alloc::{alloc::handle_alloc_error, boxed::Box, sync::Arc};
+use core::{
+    alloc::Layout,
+    cell::{Cell, UnsafeCell},
+    cmp, fmt,
+    marker::PhantomData,
+    mem::{self, MaybeUninit},
+    ptr,
+    sync::atomic::{self, AtomicIsize, AtomicPtr, AtomicUsize, Ordering},
+};
 
-use crate::epoch::{self, Atomic, Owned};
-use crate::utils::{Backoff, CachePadded};
+use crossbeam_epoch::{self as epoch, Atomic, Owned};
+use crossbeam_utils::{Backoff, CachePadded};
+
+use crate::alloc_helper::Global;
 
 // Minimum buffer capacity.
 const MIN_CAP: usize = 64;
@@ -35,25 +38,35 @@ unsafe impl<T> Send for Buffer<T> {}
 
 impl<T> Buffer<T> {
     /// Allocates a new buffer with the specified capacity.
-    fn alloc(cap: usize) -> Buffer<T> {
+    fn alloc(cap: usize) -> Self {
         debug_assert_eq!(cap, cap.next_power_of_two());
 
-        let mut v = Vec::with_capacity(cap);
-        let ptr = v.as_mut_ptr();
-        mem::forget(v);
+        let ptr = Box::into_raw(
+            (0..cap)
+                .map(|_| MaybeUninit::<T>::uninit())
+                .collect::<Box<[_]>>(),
+        )
+        .cast::<T>();
 
-        Buffer { ptr, cap }
+        Self { ptr, cap }
     }
 
     /// Deallocates the buffer.
     unsafe fn dealloc(self) {
-        drop(Vec::from_raw_parts(self.ptr, 0, self.cap));
+        drop(unsafe {
+            Box::from_raw(ptr::slice_from_raw_parts_mut(
+                self.ptr.cast::<MaybeUninit<T>>(),
+                self.cap,
+            ))
+        });
     }
 
     /// Returns a pointer to the task at the specified `index`.
     unsafe fn at(&self, index: isize) -> *mut T {
         // `self.cap` is always a power of two.
-        self.ptr.offset(index & (self.cap - 1) as isize)
+        // We do all the loads at `MaybeUninit` because we might realize, after loading, that we
+        // don't actually have the right to access this memory.
+        unsafe { self.ptr.offset(index & (self.cap - 1) as isize) }
     }
 
     /// Writes `task` into the specified `index`.
@@ -62,8 +75,8 @@ impl<T> Buffer<T> {
     /// technically speaking a data race and therefore UB. We should use an atomic store here, but
     /// that would be more expensive and difficult to implement generically for all types `T`.
     /// Hence, as a hack, we use a volatile write instead.
-    unsafe fn write(&self, index: isize, task: T) {
-        ptr::write_volatile(self.at(index), task)
+    unsafe fn write(&self, index: isize, task: MaybeUninit<T>) {
+        unsafe { ptr::write_volatile(self.at(index).cast::<MaybeUninit<T>>(), task) }
     }
 
     /// Reads a task from the specified `index`.
@@ -71,18 +84,15 @@ impl<T> Buffer<T> {
     /// This method might be concurrently called with another `write` at the same index, which is
     /// technically speaking a data race and therefore UB. We should use an atomic load here, but
     /// that would be more expensive and difficult to implement generically for all types `T`.
-    /// Hence, as a hack, we use a volatile write instead.
-    unsafe fn read(&self, index: isize) -> T {
-        ptr::read_volatile(self.at(index))
+    /// Hence, as a hack, we use a volatile load instead.
+    unsafe fn read(&self, index: isize) -> MaybeUninit<T> {
+        unsafe { ptr::read_volatile(self.at(index).cast::<MaybeUninit<T>>()) }
     }
 }
 
 impl<T> Clone for Buffer<T> {
-    fn clone(&self) -> Buffer<T> {
-        Buffer {
-            ptr: self.ptr,
-            cap: self.cap,
-        }
+    fn clone(&self) -> Self {
+        *self
     }
 }
 
@@ -115,8 +125,8 @@ struct Inner<T> {
 impl<T> Drop for Inner<T> {
     fn drop(&mut self) {
         // Load the back index, front index, and buffer.
-        let b = self.back.load(Ordering::Relaxed);
-        let f = self.front.load(Ordering::Relaxed);
+        let b = *self.back.get_mut();
+        let f = *self.front.get_mut();
 
         unsafe {
             let buffer = self.buffer.load(Ordering::Relaxed, epoch::unprotected());
@@ -212,7 +222,7 @@ impl<T> Worker<T> {
     ///
     /// let w = Worker::<i32>::new_fifo();
     /// ```
-    pub fn new_fifo() -> Worker<T> {
+    pub fn new_fifo() -> Self {
         let buffer = Buffer::alloc(MIN_CAP);
 
         let inner = Arc::new(CachePadded::new(Inner {
@@ -221,7 +231,7 @@ impl<T> Worker<T> {
             buffer: CachePadded::new(Atomic::new(buffer)),
         }));
 
-        Worker {
+        Self {
             inner,
             buffer: Cell::new(buffer),
             flavor: Flavor::Fifo,
@@ -240,7 +250,7 @@ impl<T> Worker<T> {
     ///
     /// let w = Worker::<i32>::new_lifo();
     /// ```
-    pub fn new_lifo() -> Worker<T> {
+    pub fn new_lifo() -> Self {
         let buffer = Buffer::alloc(MIN_CAP);
 
         let inner = Arc::new(CachePadded::new(Inner {
@@ -249,7 +259,7 @@ impl<T> Worker<T> {
             buffer: CachePadded::new(Atomic::new(buffer)),
         }));
 
-        Worker {
+        Self {
             inner,
             buffer: Cell::new(buffer),
             flavor: Flavor::Lifo,
@@ -288,7 +298,7 @@ impl<T> Worker<T> {
         let new = Buffer::alloc(new_cap);
         let mut i = f;
         while i != b {
-            ptr::copy_nonoverlapping(buffer.at(i), new.at(i), 1);
+            unsafe { ptr::copy_nonoverlapping(buffer.at(i), new.at(i), 1) }
             i = i.wrapping_add(1);
         }
 
@@ -302,7 +312,7 @@ impl<T> Worker<T> {
                 .swap(Owned::new(new).into_shared(guard), Ordering::Release, guard);
 
         // Destroy the old buffer later.
-        guard.defer_unchecked(move || old.into_owned().into_box().dealloc());
+        unsafe { guard.defer_unchecked(move || old.into_owned().into_box().dealloc()) }
 
         // If the buffer is very large, then flush the thread-local garbage in order to deallocate
         // it as soon as possible.
@@ -406,16 +416,20 @@ impl<T> Worker<T> {
 
         // Write `task` into the slot.
         unsafe {
-            buffer.write(b, task);
+            buffer.write(b, MaybeUninit::new(task));
         }
 
+        // ThreadSanitizer does not understand fences, so we omit fence and do store with Release ordering.
+        #[cfg(not(crossbeam_sanitize_thread))]
         atomic::fence(Ordering::Release);
+        let store_order = if cfg!(crossbeam_sanitize_thread) {
+            Ordering::Release
+        } else {
+            Ordering::Relaxed
+        };
 
         // Increment the back index.
-        //
-        // This ordering could be `Relaxed`, but then thread sanitizer would falsely report data
-        // races because it doesn't understand fences.
-        self.inner.back.store(b.wrapping_add(1), Ordering::Release);
+        self.inner.back.store(b.wrapping_add(1), store_order);
     }
 
     /// Pops a task from the queue.
@@ -461,7 +475,7 @@ impl<T> Worker<T> {
                 unsafe {
                     // Read the popped task.
                     let buffer = self.buffer.get();
-                    let task = buffer.read(f);
+                    let task = buffer.read(f).assume_init();
 
                     // Shrink the buffer if `len - 1` is less than one fourth of the capacity.
                     if buffer.cap > MIN_CAP && len <= buffer.cap as isize / 4 {
@@ -509,8 +523,8 @@ impl<T> Worker<T> {
                             )
                             .is_err()
                         {
-                            // Failed. We didn't pop anything.
-                            mem::forget(task.take());
+                            // Failed. We didn't pop anything. Reset to `None`.
+                            task.take();
                         }
 
                         // Restore the back index to the original task.
@@ -524,7 +538,7 @@ impl<T> Worker<T> {
                         }
                     }
 
-                    task
+                    task.map(|t| unsafe { t.assume_init() })
                 }
             }
         }
@@ -661,12 +675,11 @@ impl<T> Stealer<T> {
                 .is_err()
         {
             // We didn't steal this task, forget it.
-            mem::forget(task);
             return Steal::Retry;
         }
 
         // Return the stolen task.
-        Steal::Success(task)
+        Steal::Success(unsafe { task.assume_init() })
     }
 
     /// Steals a batch of tasks and pushes them into another worker.
@@ -693,6 +706,45 @@ impl<T> Stealer<T> {
     /// assert_eq!(w2.pop(), Some(2));
     /// ```
     pub fn steal_batch(&self, dest: &Worker<T>) -> Steal<()> {
+        self.steal_batch_with_limit(dest, MAX_BATCH)
+    }
+
+    /// Steals no more than `limit` of tasks and pushes them into another worker.
+    ///
+    /// How many tasks exactly will be stolen is not specified. That said, this method will try to
+    /// steal around half of the tasks in the queue, but also not more than the given limit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crossbeam_deque::Worker;
+    ///
+    /// let w1 = Worker::new_fifo();
+    /// w1.push(1);
+    /// w1.push(2);
+    /// w1.push(3);
+    /// w1.push(4);
+    /// w1.push(5);
+    /// w1.push(6);
+    ///
+    /// let s = w1.stealer();
+    /// let w2 = Worker::new_fifo();
+    ///
+    /// let _ = s.steal_batch_with_limit(&w2, 2);
+    /// assert_eq!(w2.pop(), Some(1));
+    /// assert_eq!(w2.pop(), Some(2));
+    /// assert_eq!(w2.pop(), None);
+    ///
+    /// w1.push(7);
+    /// w1.push(8);
+    /// // Setting a large limit does not guarantee that all elements will be popped. In this case,
+    /// // half of the elements are currently popped, but the number of popped elements is considered
+    /// // an implementation detail that may be changed in the future.
+    /// let _ = s.steal_batch_with_limit(&w2, usize::MAX);
+    /// assert_eq!(w2.len(), 3);
+    /// ```
+    pub fn steal_batch_with_limit(&self, dest: &Worker<T>, limit: usize) -> Steal<()> {
+        assert!(limit > 0);
         if Arc::ptr_eq(&self.inner, &dest.inner) {
             if dest.is_empty() {
                 return Steal::Empty;
@@ -725,7 +777,7 @@ impl<T> Stealer<T> {
         }
 
         // Reserve capacity for the stolen batch.
-        let batch_size = cmp::min((len as usize + 1) / 2, MAX_BATCH);
+        let batch_size = cmp::min((len as usize).div_ceil(2), limit);
         dest.reserve(batch_size);
         let mut batch_size = batch_size as isize;
 
@@ -821,7 +873,6 @@ impl<T> Stealer<T> {
                             .is_err()
                     {
                         // We didn't steal this task, forget it and break from the loop.
-                        mem::forget(task);
                         batch_size = i;
                         break;
                     }
@@ -857,13 +908,17 @@ impl<T> Stealer<T> {
             }
         }
 
+        // ThreadSanitizer does not understand fences, so we omit fence and do store with Release ordering.
+        #[cfg(not(crossbeam_sanitize_thread))]
         atomic::fence(Ordering::Release);
+        let store_order = if cfg!(crossbeam_sanitize_thread) {
+            Ordering::Release
+        } else {
+            Ordering::Relaxed
+        };
 
         // Update the back index in the destination queue.
-        //
-        // This ordering could be `Relaxed`, but then thread sanitizer would falsely report data
-        // races because it doesn't understand fences.
-        dest.inner.back.store(dest_b, Ordering::Release);
+        dest.inner.back.store(dest_b, store_order);
 
         // Return with success.
         Steal::Success(())
@@ -892,6 +947,47 @@ impl<T> Stealer<T> {
     /// assert_eq!(w2.pop(), Some(2));
     /// ```
     pub fn steal_batch_and_pop(&self, dest: &Worker<T>) -> Steal<T> {
+        self.steal_batch_with_limit_and_pop(dest, MAX_BATCH)
+    }
+
+    /// Steals no more than `limit` of tasks, pushes them into another worker, and pops a task from
+    /// that worker.
+    ///
+    /// How many tasks exactly will be stolen is not specified. That said, this method will try to
+    /// steal around half of the tasks in the queue, but also not more than the given limit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crossbeam_deque::{Steal, Worker};
+    ///
+    /// let w1 = Worker::new_fifo();
+    /// w1.push(1);
+    /// w1.push(2);
+    /// w1.push(3);
+    /// w1.push(4);
+    /// w1.push(5);
+    /// w1.push(6);
+    ///
+    /// let s = w1.stealer();
+    /// let w2 = Worker::new_fifo();
+    ///
+    /// assert_eq!(s.steal_batch_with_limit_and_pop(&w2, 2), Steal::Success(1));
+    /// assert_eq!(w2.pop(), Some(2));
+    /// assert_eq!(w2.pop(), None);
+    ///
+    /// w1.push(7);
+    /// w1.push(8);
+    /// // Setting a large limit does not guarantee that all elements will be popped. In this case,
+    /// // half of the elements are currently popped, but the number of popped elements is considered
+    /// // an implementation detail that may be changed in the future.
+    /// assert_eq!(s.steal_batch_with_limit_and_pop(&w2, usize::MAX), Steal::Success(3));
+    /// assert_eq!(w2.pop(), Some(4));
+    /// assert_eq!(w2.pop(), Some(5));
+    /// assert_eq!(w2.pop(), None);
+    /// ```
+    pub fn steal_batch_with_limit_and_pop(&self, dest: &Worker<T>, limit: usize) -> Steal<T> {
+        assert!(limit > 0);
         if Arc::ptr_eq(&self.inner, &dest.inner) {
             match dest.pop() {
                 None => return Steal::Empty,
@@ -923,7 +1019,7 @@ impl<T> Stealer<T> {
         }
 
         // Reserve capacity for the stolen batch.
-        let batch_size = cmp::min((len as usize - 1) / 2, MAX_BATCH - 1);
+        let batch_size = cmp::min((len as usize - 1) / 2, limit - 1);
         dest.reserve(batch_size);
         let mut batch_size = batch_size as isize;
 
@@ -975,7 +1071,6 @@ impl<T> Stealer<T> {
                         .is_err()
                 {
                     // We didn't steal this task, forget it.
-                    mem::forget(task);
                     return Steal::Retry;
                 }
 
@@ -992,7 +1087,6 @@ impl<T> Stealer<T> {
                     .is_err()
                 {
                     // We didn't steal this task, forget it.
-                    mem::forget(task);
                     return Steal::Retry;
                 }
 
@@ -1037,7 +1131,6 @@ impl<T> Stealer<T> {
                             .is_err()
                     {
                         // We didn't steal this task, forget it and break from the loop.
-                        mem::forget(tmp);
                         batch_size = i;
                         break;
                     }
@@ -1068,22 +1161,26 @@ impl<T> Stealer<T> {
             }
         }
 
+        // ThreadSanitizer does not understand fences, so we omit fence and do store with Release ordering.
+        #[cfg(not(crossbeam_sanitize_thread))]
         atomic::fence(Ordering::Release);
+        let store_order = if cfg!(crossbeam_sanitize_thread) {
+            Ordering::Release
+        } else {
+            Ordering::Relaxed
+        };
 
         // Update the back index in the destination queue.
-        //
-        // This ordering could be `Relaxed`, but then thread sanitizer would falsely report data
-        // races because it doesn't understand fences.
-        dest.inner.back.store(dest_b, Ordering::Release);
+        dest.inner.back.store(dest_b, store_order);
 
         // Return with success.
-        Steal::Success(task)
+        Steal::Success(unsafe { task.assume_init() })
     }
 }
 
 impl<T> Clone for Stealer<T> {
-    fn clone(&self) -> Stealer<T> {
-        Stealer {
+    fn clone(&self) -> Self {
+        Self {
             inner: self.inner.clone(),
             flavor: self.flavor,
         }
@@ -1144,19 +1241,35 @@ struct Block<T> {
 }
 
 impl<T> Block<T> {
-    /// Creates an empty block that starts at `start_index`.
-    fn new() -> Block<T> {
-        // SAFETY: This is safe because:
-        //  [1] `Block::next` (AtomicPtr) may be safely zero initialized.
-        //  [2] `Block::slots` (Array) may be safely zero initialized because of [3, 4].
-        //  [3] `Slot::task` (UnsafeCell) may be safely zero initialized because it
-        //       holds a MaybeUninit.
-        //  [4] `Slot::state` (AtomicUsize) may be safely zero initialized.
-        unsafe { MaybeUninit::zeroed().assume_init() }
+    const LAYOUT: Layout = {
+        let layout = Layout::new::<Self>();
+        assert!(
+            layout.size() != 0,
+            "Block should never be zero-sized, as it has an AtomicPtr field"
+        );
+        layout
+    };
+
+    /// Creates an empty block.
+    fn new() -> Box<Self> {
+        // unsafe { Box::new_zeroed().assume_init() } requires Rust 1.92
+        match Global.allocate_zeroed(Self::LAYOUT) {
+            Some(ptr) => {
+                // SAFETY: This is safe because:
+                //  [1] `Block::next` (AtomicPtr) may be safely zero initialized.
+                //  [2] `Block::slots` (Array) may be safely zero initialized because of [3, 4].
+                //  [3] `Slot::task` (UnsafeCell) may be safely zero initialized because it
+                //       holds a MaybeUninit.
+                //  [4] `Slot::state` (AtomicUsize) may be safely zero initialized.
+                unsafe { Box::from_raw(ptr.as_ptr().cast()) }
+            }
+            // Handle allocation failure
+            None => handle_alloc_error(Self::LAYOUT),
+        }
     }
 
     /// Waits until the next pointer is set.
-    fn wait_next(&self) -> *mut Block<T> {
+    fn wait_next(&self) -> *mut Self {
         let backoff = Backoff::new();
         loop {
             let next = self.next.load(Ordering::Acquire);
@@ -1168,11 +1281,11 @@ impl<T> Block<T> {
     }
 
     /// Sets the `DESTROY` bit in slots starting from `start` and destroys the block.
-    unsafe fn destroy(this: *mut Block<T>, count: usize) {
+    unsafe fn destroy(this: *mut Self, count: usize) {
         // It is not necessary to set the `DESTROY` bit in the last slot because that slot has
         // begun destruction of the block.
         for i in (0..count).rev() {
-            let slot = (*this).slots.get_unchecked(i);
+            let slot = unsafe { (*this).slots.get_unchecked(i) };
 
             // Mark the `DESTROY` bit if a thread is still using the slot.
             if slot.state.load(Ordering::Acquire) & READ == 0
@@ -1184,7 +1297,7 @@ impl<T> Block<T> {
         }
 
         // No thread is using the block, now it is safe to destroy it.
-        drop(Box::from_raw(this));
+        drop(unsafe { Box::from_raw(this) });
     }
 }
 
@@ -1205,6 +1318,7 @@ struct Position<T> {
 /// # Examples
 ///
 /// ```
+/// # if option_env!("MIRI_FALLIBLE_WEAK_CAS").is_some() { return; } // see ci/miri.sh
 /// use crossbeam_deque::{Injector, Steal};
 ///
 /// let q = Injector::new();
@@ -1231,7 +1345,7 @@ unsafe impl<T: Send> Sync for Injector<T> {}
 
 impl<T> Default for Injector<T> {
     fn default() -> Self {
-        let block = Box::into_raw(Box::new(Block::<T>::new()));
+        let block = Box::into_raw(Block::<T>::new());
         Self {
             head: CachePadded::new(Position {
                 block: AtomicPtr::new(block),
@@ -1256,7 +1370,7 @@ impl<T> Injector<T> {
     ///
     /// let q = Injector::<i32>::new();
     /// ```
-    pub fn new() -> Injector<T> {
+    pub fn new() -> Self {
         Self::default()
     }
 
@@ -1292,7 +1406,7 @@ impl<T> Injector<T> {
             // If we're going to have to install the next block, allocate it in advance in order to
             // make the wait for other threads as short as possible.
             if offset + 1 == BLOCK_CAP && next_block.is_none() {
-                next_block = Some(Box::new(Block::<T>::new()));
+                next_block = Some(Block::<T>::new());
             }
 
             let new_tail = tail + (1 << SHIFT);
@@ -1336,6 +1450,7 @@ impl<T> Injector<T> {
     /// # Examples
     ///
     /// ```
+    /// # if option_env!("MIRI_FALLIBLE_WEAK_CAS").is_some() { return; } // see ci/miri.sh
     /// use crossbeam_deque::{Injector, Steal};
     ///
     /// let q = Injector::new();
@@ -1432,6 +1547,7 @@ impl<T> Injector<T> {
     /// # Examples
     ///
     /// ```
+    /// # if option_env!("MIRI_FALLIBLE_WEAK_CAS").is_some() { return; } // see ci/miri.sh
     /// use crossbeam_deque::{Injector, Worker};
     ///
     /// let q = Injector::new();
@@ -1446,6 +1562,44 @@ impl<T> Injector<T> {
     /// assert_eq!(w.pop(), Some(2));
     /// ```
     pub fn steal_batch(&self, dest: &Worker<T>) -> Steal<()> {
+        self.steal_batch_with_limit(dest, MAX_BATCH)
+    }
+
+    /// Steals no more than `limit` of tasks and pushes them into a worker.
+    ///
+    /// How many tasks exactly will be stolen is not specified. That said, this method will try to
+    /// steal around half of the tasks in the queue, but also not more than some constant limit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # if option_env!("MIRI_FALLIBLE_WEAK_CAS").is_some() { return; } // see ci/miri.sh
+    /// use crossbeam_deque::{Injector, Worker};
+    ///
+    /// let q = Injector::new();
+    /// q.push(1);
+    /// q.push(2);
+    /// q.push(3);
+    /// q.push(4);
+    /// q.push(5);
+    /// q.push(6);
+    ///
+    /// let w = Worker::new_fifo();
+    /// let _ = q.steal_batch_with_limit(&w, 2);
+    /// assert_eq!(w.pop(), Some(1));
+    /// assert_eq!(w.pop(), Some(2));
+    /// assert_eq!(w.pop(), None);
+    ///
+    /// q.push(7);
+    /// q.push(8);
+    /// // Setting a large limit does not guarantee that all elements will be popped. In this case,
+    /// // half of the elements are currently popped, but the number of popped elements is considered
+    /// // an implementation detail that may be changed in the future.
+    /// let _ = q.steal_batch_with_limit(&w, usize::MAX);
+    /// assert_eq!(w.len(), 3);
+    /// ```
+    pub fn steal_batch_with_limit(&self, dest: &Worker<T>, limit: usize) -> Steal<()> {
+        assert!(limit > 0);
         let mut head;
         let mut block;
         let mut offset;
@@ -1483,15 +1637,15 @@ impl<T> Injector<T> {
             if (head >> SHIFT) / LAP != (tail >> SHIFT) / LAP {
                 new_head |= HAS_NEXT;
                 // We can steal all tasks till the end of the block.
-                advance = (BLOCK_CAP - offset).min(MAX_BATCH);
+                advance = (BLOCK_CAP - offset).min(limit);
             } else {
                 let len = (tail - head) >> SHIFT;
                 // Steal half of the available tasks.
-                advance = ((len + 1) / 2).min(MAX_BATCH);
+                advance = len.div_ceil(2).min(limit);
             }
         } else {
             // We can steal all tasks till the end of the block.
-            advance = (BLOCK_CAP - offset).min(MAX_BATCH);
+            advance = (BLOCK_CAP - offset).min(limit);
         }
 
         new_head += advance << SHIFT;
@@ -1535,7 +1689,7 @@ impl<T> Injector<T> {
                         // Read the task.
                         let slot = (*block).slots.get_unchecked(offset + i);
                         slot.wait_write();
-                        let task = slot.task.get().read().assume_init();
+                        let task = slot.task.get().read();
 
                         // Write it into the destination queue.
                         dest_buffer.write(dest_b.wrapping_add(i as isize), task);
@@ -1547,7 +1701,7 @@ impl<T> Injector<T> {
                         // Read the task.
                         let slot = (*block).slots.get_unchecked(offset + i);
                         slot.wait_write();
-                        let task = slot.task.get().read().assume_init();
+                        let task = slot.task.get().read();
 
                         // Write it into the destination queue.
                         dest_buffer.write(dest_b.wrapping_add((batch_size - 1 - i) as isize), task);
@@ -1555,15 +1709,19 @@ impl<T> Injector<T> {
                 }
             }
 
+            // ThreadSanitizer does not understand fences, so we omit fence and do store with Release ordering.
+            #[cfg(not(crossbeam_sanitize_thread))]
             atomic::fence(Ordering::Release);
+            let store_order = if cfg!(crossbeam_sanitize_thread) {
+                Ordering::Release
+            } else {
+                Ordering::Relaxed
+            };
 
             // Update the back index in the destination queue.
-            //
-            // This ordering could be `Relaxed`, but then thread sanitizer would falsely report
-            // data races because it doesn't understand fences.
             dest.inner
                 .back
-                .store(dest_b.wrapping_add(batch_size as isize), Ordering::Release);
+                .store(dest_b.wrapping_add(batch_size as isize), store_order);
 
             // Destroy the block if we've reached the end, or if another thread wanted to destroy
             // but couldn't because we were busy reading from the slot.
@@ -1592,6 +1750,7 @@ impl<T> Injector<T> {
     /// # Examples
     ///
     /// ```
+    /// # if option_env!("MIRI_FALLIBLE_WEAK_CAS").is_some() { return; } // see ci/miri.sh
     /// use crossbeam_deque::{Injector, Steal, Worker};
     ///
     /// let q = Injector::new();
@@ -1605,6 +1764,46 @@ impl<T> Injector<T> {
     /// assert_eq!(w.pop(), Some(2));
     /// ```
     pub fn steal_batch_and_pop(&self, dest: &Worker<T>) -> Steal<T> {
+        // TODO: we use `MAX_BATCH + 1` as the hard limit for Injecter as the performance is slightly
+        // better, but we may change it in the future to be compatible with the same method in Stealer.
+        self.steal_batch_with_limit_and_pop(dest, MAX_BATCH + 1)
+    }
+
+    /// Steals no more than `limit` of tasks, pushes them into a worker, and pops a task from that worker.
+    ///
+    /// How many tasks exactly will be stolen is not specified. That said, this method will try to
+    /// steal around half of the tasks in the queue, but also not more than the given limit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # if option_env!("MIRI_FALLIBLE_WEAK_CAS").is_some() { return; } // see ci/miri.sh
+    /// use crossbeam_deque::{Injector, Steal, Worker};
+    ///
+    /// let q = Injector::new();
+    /// q.push(1);
+    /// q.push(2);
+    /// q.push(3);
+    /// q.push(4);
+    /// q.push(5);
+    /// q.push(6);
+    ///
+    /// let w = Worker::new_fifo();
+    /// assert_eq!(q.steal_batch_with_limit_and_pop(&w, 2), Steal::Success(1));
+    /// assert_eq!(w.pop(), Some(2));
+    /// assert_eq!(w.pop(), None);
+    ///
+    /// q.push(7);
+    /// // Setting a large limit does not guarantee that all elements will be popped. In this case,
+    /// // half of the elements are currently popped, but the number of popped elements is considered
+    /// // an implementation detail that may be changed in the future.
+    /// assert_eq!(q.steal_batch_with_limit_and_pop(&w, usize::MAX), Steal::Success(3));
+    /// assert_eq!(w.pop(), Some(4));
+    /// assert_eq!(w.pop(), Some(5));
+    /// assert_eq!(w.pop(), None);
+    /// ```
+    pub fn steal_batch_with_limit_and_pop(&self, dest: &Worker<T>, limit: usize) -> Steal<T> {
+        assert!(limit > 0);
         let mut head;
         let mut block;
         let mut offset;
@@ -1641,15 +1840,15 @@ impl<T> Injector<T> {
             if (head >> SHIFT) / LAP != (tail >> SHIFT) / LAP {
                 new_head |= HAS_NEXT;
                 // We can steal all tasks till the end of the block.
-                advance = (BLOCK_CAP - offset).min(MAX_BATCH + 1);
+                advance = (BLOCK_CAP - offset).min(limit);
             } else {
                 let len = (tail - head) >> SHIFT;
                 // Steal half of the available tasks.
-                advance = ((len + 1) / 2).min(MAX_BATCH + 1);
+                advance = len.div_ceil(2).min(limit);
             }
         } else {
             // We can steal all tasks till the end of the block.
-            advance = (BLOCK_CAP - offset).min(MAX_BATCH + 1);
+            advance = (BLOCK_CAP - offset).min(limit);
         }
 
         new_head += advance << SHIFT;
@@ -1689,7 +1888,7 @@ impl<T> Injector<T> {
             // Read the task.
             let slot = (*block).slots.get_unchecked(offset);
             slot.wait_write();
-            let task = slot.task.get().read().assume_init();
+            let task = slot.task.get().read();
 
             match dest.flavor {
                 Flavor::Fifo => {
@@ -1698,7 +1897,7 @@ impl<T> Injector<T> {
                         // Read the task.
                         let slot = (*block).slots.get_unchecked(offset + i + 1);
                         slot.wait_write();
-                        let task = slot.task.get().read().assume_init();
+                        let task = slot.task.get().read();
 
                         // Write it into the destination queue.
                         dest_buffer.write(dest_b.wrapping_add(i as isize), task);
@@ -1711,7 +1910,7 @@ impl<T> Injector<T> {
                         // Read the task.
                         let slot = (*block).slots.get_unchecked(offset + i + 1);
                         slot.wait_write();
-                        let task = slot.task.get().read().assume_init();
+                        let task = slot.task.get().read();
 
                         // Write it into the destination queue.
                         dest_buffer.write(dest_b.wrapping_add((batch_size - 1 - i) as isize), task);
@@ -1719,15 +1918,19 @@ impl<T> Injector<T> {
                 }
             }
 
+            // ThreadSanitizer does not understand fences, so we omit fence and do store with Release ordering.
+            #[cfg(not(crossbeam_sanitize_thread))]
             atomic::fence(Ordering::Release);
+            let store_order = if cfg!(crossbeam_sanitize_thread) {
+                Ordering::Release
+            } else {
+                Ordering::Relaxed
+            };
 
             // Update the back index in the destination queue.
-            //
-            // This ordering could be `Relaxed`, but then thread sanitizer would falsely report
-            // data races because it doesn't understand fences.
             dest.inner
                 .back
-                .store(dest_b.wrapping_add(batch_size as isize), Ordering::Release);
+                .store(dest_b.wrapping_add(batch_size as isize), store_order);
 
             // Destroy the block if we've reached the end, or if another thread wanted to destroy
             // but couldn't because we were busy reading from the slot.
@@ -1744,7 +1947,7 @@ impl<T> Injector<T> {
                 }
             }
 
-            Steal::Success(task)
+            Steal::Success(task.assume_init())
         }
     }
 
@@ -1820,9 +2023,9 @@ impl<T> Injector<T> {
 
 impl<T> Drop for Injector<T> {
     fn drop(&mut self) {
-        let mut head = self.head.index.load(Ordering::Relaxed);
-        let mut tail = self.tail.index.load(Ordering::Relaxed);
-        let mut block = self.head.block.load(Ordering::Relaxed);
+        let mut head = *self.head.index.get_mut();
+        let mut tail = *self.tail.index.get_mut();
+        let mut block = *self.head.block.get_mut();
 
         // Erase the lower bits.
         head &= !((1 << SHIFT) - 1);
@@ -1836,11 +2039,10 @@ impl<T> Drop for Injector<T> {
                 if offset < BLOCK_CAP {
                     // Drop the task in the slot.
                     let slot = (*block).slots.get_unchecked(offset);
-                    let p = &mut *slot.task.get();
-                    p.as_mut_ptr().drop_in_place();
+                    (*slot.task.get()).assume_init_drop();
                 } else {
                     // Deallocate the block and move to the next one.
-                    let next = (*block).next.load(Ordering::Relaxed);
+                    let next = *(*block).next.get_mut();
                     drop(Box::from_raw(block));
                     block = next;
                 }
@@ -1856,7 +2058,7 @@ impl<T> Drop for Injector<T> {
 
 impl<T> fmt::Debug for Injector<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("Worker { .. }")
+        f.pad("Injector { .. }")
     }
 }
 
@@ -1905,10 +2107,7 @@ impl<T> Steal<T> {
     /// assert!(Empty::<i32>.is_empty());
     /// ```
     pub fn is_empty(&self) -> bool {
-        match self {
-            Steal::Empty => true,
-            _ => false,
-        }
+        matches!(self, Self::Empty)
     }
 
     /// Returns `true` if at least one task was stolen.
@@ -1924,10 +2123,7 @@ impl<T> Steal<T> {
     /// assert!(Success(7).is_success());
     /// ```
     pub fn is_success(&self) -> bool {
-        match self {
-            Steal::Success(_) => true,
-            _ => false,
-        }
+        matches!(self, Self::Success(_))
     }
 
     /// Returns `true` if the steal operation needs to be retried.
@@ -1943,10 +2139,7 @@ impl<T> Steal<T> {
     /// assert!(Retry::<i32>.is_retry());
     /// ```
     pub fn is_retry(&self) -> bool {
-        match self {
-            Steal::Retry => true,
-            _ => false,
-        }
+        matches!(self, Self::Retry)
     }
 
     /// Returns the result of the operation, if successful.
@@ -1963,7 +2156,7 @@ impl<T> Steal<T> {
     /// ```
     pub fn success(self) -> Option<T> {
         match self {
-            Steal::Success(res) => Some(res),
+            Self::Success(res) => Some(res),
             _ => None,
         }
     }
@@ -1989,18 +2182,18 @@ impl<T> Steal<T> {
     ///
     /// assert_eq!(Empty.or_else(|| Empty), Empty::<i32>);
     /// ```
-    pub fn or_else<F>(self, f: F) -> Steal<T>
+    pub fn or_else<F>(self, f: F) -> Self
     where
-        F: FnOnce() -> Steal<T>,
+        F: FnOnce() -> Self,
     {
         match self {
-            Steal::Empty => f(),
-            Steal::Success(_) => self,
-            Steal::Retry => {
-                if let Steal::Success(res) = f() {
-                    Steal::Success(res)
+            Self::Empty => f(),
+            Self::Success(_) => self,
+            Self::Retry => {
+                if let Self::Success(res) = f() {
+                    Self::Success(res)
                 } else {
-                    Steal::Retry
+                    Self::Retry
                 }
             }
         }
@@ -2010,35 +2203,31 @@ impl<T> Steal<T> {
 impl<T> fmt::Debug for Steal<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Steal::Empty => f.pad("Empty"),
-            Steal::Success(_) => f.pad("Success(..)"),
-            Steal::Retry => f.pad("Retry"),
+            Self::Empty => f.pad("Empty"),
+            Self::Success(_) => f.pad("Success(..)"),
+            Self::Retry => f.pad("Retry"),
         }
     }
 }
 
-impl<T> FromIterator<Steal<T>> for Steal<T> {
+impl<T> FromIterator<Self> for Steal<T> {
     /// Consumes items until a `Success` is found and returns it.
     ///
     /// If no `Success` was found, but there was at least one `Retry`, then returns `Retry`.
     /// Otherwise, `Empty` is returned.
-    fn from_iter<I>(iter: I) -> Steal<T>
+    fn from_iter<I>(iter: I) -> Self
     where
-        I: IntoIterator<Item = Steal<T>>,
+        I: IntoIterator<Item = Self>,
     {
         let mut retry = false;
         for s in iter {
             match &s {
-                Steal::Empty => {}
-                Steal::Success(_) => return s,
-                Steal::Retry => retry = true,
+                Self::Empty => {}
+                Self::Success(_) => return s,
+                Self::Retry => retry = true,
             }
         }
 
-        if retry {
-            Steal::Retry
-        } else {
-            Steal::Empty
-        }
+        if retry { Self::Retry } else { Self::Empty }
     }
 }

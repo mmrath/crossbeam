@@ -1,7 +1,8 @@
 //! Tests that make sure accessing thread-locals while exiting the thread doesn't cause panics.
 
-use std::thread;
-use std::time::Duration;
+#![cfg(not(miri))] // Miri detects that this test is buggy: the destructor of `FOO` uses `std::thread::current()`!
+
+use std::{thread, time::Duration};
 
 use crossbeam_channel::{select, unbounded};
 use crossbeam_utils::thread::scope;
@@ -28,7 +29,7 @@ fn use_while_exiting() {
     }
 
     thread_local! {
-        static FOO: Foo = Foo;
+        static FOO: Foo = const { Foo };
     }
 
     let (s, r) = unbounded::<()>();

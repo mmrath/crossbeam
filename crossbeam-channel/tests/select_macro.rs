@@ -1,15 +1,20 @@
 //! Tests for the `select!` macro.
 
 #![forbid(unsafe_code)] // select! is safe.
+#![allow(clippy::match_single_binding)]
 
-use std::any::Any;
-use std::cell::Cell;
-use std::ops::Deref;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::{
+    any::Any,
+    cell::Cell,
+    ops::Deref,
+    thread,
+    time::{Duration, Instant},
+};
 
-use crossbeam_channel::{after, bounded, never, select, tick, unbounded};
-use crossbeam_channel::{Receiver, RecvError, SendError, Sender, TryRecvError};
+use crossbeam_channel::{
+    Receiver, RecvError, SendError, Sender, TryRecvError, after, bounded, never, select,
+    select_biased, tick, unbounded,
+};
 use crossbeam_utils::thread::scope;
 
 fn ms(ms: u64) -> Duration {
@@ -210,6 +215,7 @@ fn default_when_disconnected() {
 }
 
 #[test]
+#[cfg_attr(gha_macos_runner, ignore = "GitHub-hosted macOS runner is slow")]
 fn default_only() {
     let start = Instant::now();
     select! {
@@ -293,27 +299,31 @@ fn loop_try() {
         let (s_end, r_end) = bounded::<()>(0);
 
         scope(|scope| {
-            scope.spawn(|_| loop {
-                select! {
-                    send(s1, 1) -> _ => break,
-                    default => {}
-                }
+            scope.spawn(|_| {
+                loop {
+                    select! {
+                        send(s1, 1) -> _ => break,
+                        default => {}
+                    }
 
-                select! {
-                    recv(r_end) -> _ => break,
-                    default => {}
+                    select! {
+                        recv(r_end) -> _ => break,
+                        default => {}
+                    }
                 }
             });
 
-            scope.spawn(|_| loop {
-                if let Ok(x) = r2.try_recv() {
-                    assert_eq!(x, 2);
-                    break;
-                }
+            scope.spawn(|_| {
+                loop {
+                    if let Ok(x) = r2.try_recv() {
+                        assert_eq!(x, 2);
+                        break;
+                    }
 
-                select! {
-                    recv(r_end) -> _ => break,
-                    default => {}
+                    select! {
+                        recv(r_end) -> _ => break,
+                        default => {}
+                    }
                 }
             });
 
@@ -463,7 +473,7 @@ fn panic_sender() {
         panic!("send panicked")
     }
 
-    #[allow(unreachable_code)]
+    #[allow(unreachable_code, clippy::diverging_sub_expression)]
     {
         select! {
             send(get(), panic!()) -> _ => {}
@@ -485,7 +495,7 @@ fn panic_receiver() {
 
 #[test]
 fn stress_recv() {
-    const COUNT: usize = 10_000;
+    const COUNT: usize = if cfg!(miri) { 50 } else { 10_000 };
 
     let (s1, r1) = unbounded();
     let (s2, r2) = bounded(5);
@@ -518,7 +528,7 @@ fn stress_recv() {
 
 #[test]
 fn stress_send() {
-    const COUNT: usize = 10_000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 10_000 };
 
     let (s1, r1) = bounded(0);
     let (s2, r2) = bounded(0);
@@ -548,7 +558,7 @@ fn stress_send() {
 
 #[test]
 fn stress_mixed() {
-    const COUNT: usize = 10_000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 10_000 };
 
     let (s1, r1) = bounded(0);
     let (s2, r2) = bounded(0);
@@ -681,7 +691,7 @@ fn matching_with_leftover() {
 
 #[test]
 fn channel_through_channel() {
-    const COUNT: usize = 1000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 1000 };
 
     type T = Box<dyn Any + Send>;
 
@@ -726,7 +736,7 @@ fn channel_through_channel() {
 
 #[test]
 fn linearizable_default() {
-    const COUNT: usize = 100_000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 100_000 };
 
     for step in 0..2 {
         let (start_s, start_r) = bounded::<()>(0);
@@ -770,7 +780,7 @@ fn linearizable_default() {
 
 #[test]
 fn linearizable_timeout() {
-    const COUNT: usize = 100_000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 100_000 };
 
     for step in 0..2 {
         let (start_s, start_r) = bounded::<()>(0);
@@ -814,7 +824,7 @@ fn linearizable_timeout() {
 
 #[test]
 fn fairness1() {
-    const COUNT: usize = 10_000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 10_000 };
 
     let (s1, r1) = bounded::<()>(COUNT);
     let (s2, r2) = unbounded::<()>();
@@ -837,8 +847,9 @@ fn fairness1() {
 }
 
 #[test]
+#[cfg_attr(crossbeam_sanitize, ignore)] // TODO: flaky: https://github.com/crossbeam-rs/crossbeam/issues/1094
 fn fairness2() {
-    const COUNT: usize = 10_000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 10_000 };
 
     let (s1, r1) = unbounded::<()>();
     let (s2, r2) = bounded::<()>(1);
@@ -875,7 +886,7 @@ fn fairness2() {
 
 #[test]
 fn fairness_recv() {
-    const COUNT: usize = 10_000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 10_000 };
 
     let (s1, r1) = bounded::<()>(COUNT);
     let (s2, r2) = unbounded::<()>();
@@ -897,7 +908,7 @@ fn fairness_recv() {
 
 #[test]
 fn fairness_send() {
-    const COUNT: usize = 10_000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 10_000 };
 
     let (s1, _r1) = bounded::<()>(COUNT);
     let (s2, _r2) = unbounded::<()>();
@@ -912,6 +923,113 @@ fn fairness_send() {
     assert!(hits.iter().all(|x| *x >= COUNT / 4));
 }
 
+#[test]
+fn unfairness() {
+    const COUNT: usize = if cfg!(miri) { 100 } else { 10_000 };
+
+    let (s1, r1) = unbounded::<()>();
+    let (s2, r2) = unbounded::<()>();
+    let (s3, r3) = unbounded::<()>();
+
+    for _ in 0..COUNT {
+        s1.send(()).unwrap();
+        s2.send(()).unwrap();
+    }
+    s3.send(()).unwrap();
+
+    let mut hits = [0usize; 3];
+    for _ in 0..COUNT {
+        select_biased! {
+            recv(r1) -> _ => hits[0] += 1,
+            recv(r2) -> _ => hits[1] += 1,
+            recv(r3) -> _ => hits[2] += 1,
+        }
+    }
+    assert_eq!(hits, [COUNT, 0, 0]);
+
+    for _ in 0..COUNT {
+        select_biased! {
+            recv(r1) -> _ => hits[0] += 1,
+            recv(r2) -> _ => hits[1] += 1,
+            recv(r3) -> _ => hits[2] += 1,
+        }
+    }
+    assert_eq!(hits, [COUNT, COUNT, 0]);
+}
+
+#[test]
+fn unfairness_timeout() {
+    const COUNT: usize = if cfg!(miri) { 100 } else { 10_000 };
+
+    let (s1, r1) = unbounded::<()>();
+    let (s2, r2) = unbounded::<()>();
+    let (s3, r3) = unbounded::<()>();
+
+    for _ in 0..COUNT {
+        s1.send(()).unwrap();
+        s2.send(()).unwrap();
+    }
+    s3.send(()).unwrap();
+
+    let mut hits = [0usize; 3];
+    for _ in 0..COUNT {
+        select_biased! {
+            recv(r1) -> _ => hits[0] += 1,
+            recv(r2) -> _ => hits[1] += 1,
+            recv(r3) -> _ => hits[2] += 1,
+            default(ms(1000)) => unreachable!(),
+        }
+    }
+    assert_eq!(hits, [COUNT, 0, 0]);
+
+    for _ in 0..COUNT {
+        select_biased! {
+            recv(r1) -> _ => hits[0] += 1,
+            recv(r2) -> _ => hits[1] += 1,
+            recv(r3) -> _ => hits[2] += 1,
+            default(ms(1000)) => unreachable!(),
+        }
+    }
+    assert_eq!(hits, [COUNT, COUNT, 0]);
+}
+
+#[test]
+fn unfairness_try() {
+    const COUNT: usize = if cfg!(miri) { 100 } else { 10_000 };
+
+    let (s1, r1) = unbounded::<()>();
+    let (s2, r2) = unbounded::<()>();
+    let (s3, r3) = unbounded::<()>();
+
+    for _ in 0..COUNT {
+        s1.send(()).unwrap();
+        s2.send(()).unwrap();
+    }
+    s3.send(()).unwrap();
+
+    let mut hits = [0usize; 3];
+    for _ in 0..COUNT {
+        select_biased! {
+            recv(r1) -> _ => hits[0] += 1,
+            recv(r2) -> _ => hits[1] += 1,
+            recv(r3) -> _ => hits[2] += 1,
+            default() => unreachable!(),
+        }
+    }
+    assert_eq!(hits, [COUNT, 0, 0]);
+
+    for _ in 0..COUNT {
+        select_biased! {
+            recv(r1) -> _ => hits[0] += 1,
+            recv(r2) -> _ => hits[1] += 1,
+            recv(r3) -> _ => hits[2] += 1,
+            default() => unreachable!(),
+        }
+    }
+    assert_eq!(hits, [COUNT, COUNT, 0]);
+}
+
+#[allow(clippy::or_fun_call, clippy::unnecessary_literal_unwrap)] // This is intentional.
 #[test]
 fn references() {
     let (s, r) = unbounded::<i32>();
@@ -933,6 +1051,7 @@ fn references() {
     }
 }
 
+#[allow(clippy::never_loop)] // This is intentional.
 #[test]
 fn case_blocks() {
     let (s, r) = unbounded::<i32>();
@@ -958,6 +1077,7 @@ fn case_blocks() {
     drop(s);
 }
 
+#[allow(clippy::redundant_closure_call)] // This is intentional.
 #[test]
 fn move_handles() {
     let (s, r) = unbounded::<i32>();
@@ -1179,32 +1299,32 @@ fn result_types() {
     let (_, r) = bounded::<i32>(0);
 
     select! {
-        recv(r) -> res => drop::<Result<i32, RecvError>>(res),
+        recv(r) -> res => { let _: Result<i32, RecvError> = res; },
     }
     select! {
-        recv(r) -> res => drop::<Result<i32, RecvError>>(res),
+        recv(r) -> res =>  { let _: Result<i32, RecvError> = res; },
         default => {}
     }
     select! {
-        recv(r) -> res => drop::<Result<i32, RecvError>>(res),
+        recv(r) -> res =>  { let _: Result<i32, RecvError> = res; },
         default(ms(0)) => {}
     }
 
     select! {
-        send(s, 0) -> res => drop::<Result<(), SendError<i32>>>(res),
+        send(s, 0) -> res => { let _: Result<(), SendError<i32>> = res; },
     }
     select! {
-        send(s, 0) -> res => drop::<Result<(), SendError<i32>>>(res),
+        send(s, 0) -> res =>  { let _: Result<(), SendError<i32>> = res; },
         default => {}
     }
     select! {
-        send(s, 0) -> res => drop::<Result<(), SendError<i32>>>(res),
+        send(s, 0) -> res =>  { let _: Result<(), SendError<i32>> = res; },
         default(ms(0)) => {}
     }
 
     select! {
-        send(s, 0) -> res => drop::<Result<(), SendError<i32>>>(res),
-        recv(r) -> res => drop::<Result<i32, RecvError>>(res),
+        send(s, 0) -> res =>  { let _: Result<(), SendError<i32>> = res; },
+        recv(r) -> res => { let _: Result<i32, RecvError> = res; },
     }
 }
 
@@ -1433,4 +1553,15 @@ fn disconnect_wakes_receiver() {
         });
     })
     .unwrap();
+}
+
+#[test]
+fn trailing_comma() {
+    let (s, r) = unbounded::<usize>();
+
+    select! {
+        send(s, 1,) -> _ => {},
+        recv(r,) -> _ => {},
+        default(ms(1000),) => {},
+    }
 }

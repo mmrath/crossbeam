@@ -8,12 +8,14 @@
 //! Simon Doherty, Lindsay Groves, Victor Luchangco, and Mark Moir. 2004b. Formal Verification of a
 //! Practical Lock-Free Queue Algorithm. <https://doi.org/10.1007/978-3-540-30232-2_7>
 
-use core::mem::MaybeUninit;
-use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use core::{
+    mem::MaybeUninit,
+    sync::atomic::Ordering::{Acquire, Relaxed, Release},
+};
 
 use crossbeam_utils::CachePadded;
 
-use crate::{unprotected, Atomic, Guard, Owned, Shared};
+use crate::{Atomic, Guard, Owned, Shared, unprotected};
 
 // The representation here is a singly-linked list, with a sentinel node at the front. In general
 // the `tail` pointer may lag behind the actual tail. Non-sentinel nodes are either all `Data` or
@@ -42,8 +44,8 @@ unsafe impl<T: Send> Send for Queue<T> {}
 
 impl<T> Queue<T> {
     /// Create a new, empty queue.
-    pub(crate) fn new() -> Queue<T> {
-        let q = Queue {
+    pub(crate) fn new() -> Self {
+        let q = Self {
             head: CachePadded::new(Atomic::null()),
             tail: CachePadded::new(Atomic::null()),
         };
@@ -132,8 +134,7 @@ impl<T> Queue<T> {
                                 .compare_exchange(tail, next, Release, Relaxed, guard);
                         }
                         guard.defer_destroy(head);
-                        // TODO: Replace with MaybeUninit::read when api is stable
-                        Some(n.data.as_ptr().read())
+                        Some(n.data.assume_init_read())
                     })
                     .map_err(|_| ())
             },
@@ -165,7 +166,7 @@ impl<T> Queue<T> {
                                 .compare_exchange(tail, next, Release, Relaxed, guard);
                         }
                         guard.defer_destroy(head);
-                        Some(n.data.as_ptr().read())
+                        Some(n.data.assume_init_read())
                     })
                     .map_err(|_| ())
             },
@@ -216,18 +217,26 @@ impl<T> Drop for Queue<T> {
 }
 
 #[cfg(all(test, not(crossbeam_loom)))]
+#[allow(
+    clippy::alloc_instead_of_core,
+    clippy::std_instead_of_alloc,
+    clippy::std_instead_of_core
+)]
 mod test {
+    use std::vec;
+
+    use crossbeam_utils::thread;
+
     use super::*;
     use crate::pin;
-    use crossbeam_utils::thread;
 
     struct Queue<T> {
         queue: super::Queue<T>,
     }
 
     impl<T> Queue<T> {
-        pub(crate) fn new() -> Queue<T> {
-            Queue {
+        pub(crate) fn new() -> Self {
+            Self {
                 queue: super::Queue::new(),
             }
         }
@@ -259,7 +268,7 @@ mod test {
         }
     }
 
-    const CONC_COUNT: i64 = 1000000;
+    const CONC_COUNT: i64 = if cfg!(miri) { 1000 } else { 1000000 };
 
     #[test]
     fn push_try_pop_1() {
@@ -422,8 +431,8 @@ mod test {
 
                     let mut vl2 = vl.clone();
                     let mut vr2 = vr.clone();
-                    vl2.sort();
-                    vr2.sort();
+                    vl2.sort_unstable();
+                    vr2.sort_unstable();
 
                     assert_eq!(vl, vl2);
                     assert_eq!(vr, vr2);

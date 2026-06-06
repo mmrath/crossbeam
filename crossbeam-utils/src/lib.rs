@@ -24,30 +24,37 @@
 //! [`WaitGroup`]: sync::WaitGroup
 //! [`scope`]: thread::scope
 
+#![no_std]
 #![doc(test(
     no_crate_inject,
-    attr(
-        deny(warnings, rust_2018_idioms),
-        allow(dead_code, unused_assignments, unused_variables)
-    )
+    attr(allow(dead_code, unused_assignments, unused_variables))
 ))]
 #![warn(
     missing_docs,
-    missing_debug_implementations,
-    rust_2018_idioms,
-    unreachable_pub
+    unsafe_op_in_unsafe_fn,
+    clippy::alloc_instead_of_core,
+    clippy::std_instead_of_alloc,
+    clippy::std_instead_of_core
 )]
-#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
+#[cfg(feature = "std")]
+#[cfg(not(crossbeam_loom))]
+extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
 
 #[cfg(crossbeam_loom)]
 #[allow(unused_imports)]
 mod primitive {
+    pub(crate) mod hint {
+        pub(crate) use loom::hint::spin_loop;
+    }
     pub(crate) mod sync {
         pub(crate) mod atomic {
-            pub(crate) use loom::sync::atomic::spin_loop_hint;
             pub(crate) use loom::sync::atomic::{
-                AtomicBool, AtomicI16, AtomicI32, AtomicI64, AtomicI8, AtomicIsize, AtomicU16,
-                AtomicU32, AtomicU64, AtomicU8, AtomicUsize,
+                AtomicBool, AtomicI8, AtomicI16, AtomicI32, AtomicI64, AtomicIsize, AtomicU8,
+                AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
             };
 
             // FIXME: loom does not support compiler_fence at the moment.
@@ -55,7 +62,7 @@ mod primitive {
             // we use fence as a stand-in for compiler_fence for the time being.
             // this may miss some races since fence is stronger than compiler_fence,
             // but it's the best we can do for the time being.
-            pub(crate) use loom::sync::atomic::fence as compiler_fence;
+            pub(crate) use self::fence as compiler_fence;
         }
         pub(crate) use loom::sync::{Arc, Condvar, Mutex};
     }
@@ -63,27 +70,20 @@ mod primitive {
 #[cfg(not(crossbeam_loom))]
 #[allow(unused_imports)]
 mod primitive {
+    pub(crate) mod hint {
+        pub(crate) use core::hint::spin_loop;
+    }
     pub(crate) mod sync {
-        pub(crate) mod atomic {
-            pub(crate) use core::sync::atomic::compiler_fence;
-            // TODO(taiki-e): once we bump the minimum required Rust version to 1.49+,
-            // use [`core::hint::spin_loop`] instead.
-            #[allow(deprecated)]
-            pub(crate) use core::sync::atomic::spin_loop_hint;
-            #[cfg(not(crossbeam_no_atomic))]
-            pub(crate) use core::sync::atomic::{
-                AtomicBool, AtomicI16, AtomicI32, AtomicI8, AtomicIsize, AtomicU16, AtomicU32,
-                AtomicU8, AtomicUsize,
-            };
-            #[cfg(not(crossbeam_no_atomic_64))]
-            pub(crate) use core::sync::atomic::{AtomicI64, AtomicU64};
-        }
-
         #[cfg(feature = "std")]
-        pub(crate) use std::sync::{Arc, Condvar, Mutex};
+        pub(crate) use alloc::sync::Arc;
+        pub(crate) use core::sync::atomic;
+        #[cfg(feature = "std")]
+        pub(crate) use std::sync::{Condvar, Mutex};
     }
 }
 
+#[cfg(feature = "atomic")]
+#[cfg_attr(docsrs, doc(cfg(feature = "atomic")))]
 pub mod atomic;
 
 mod cache_padded;
@@ -92,13 +92,9 @@ pub use crate::cache_padded::CachePadded;
 mod backoff;
 pub use crate::backoff::Backoff;
 
-use cfg_if::cfg_if;
+#[cfg(feature = "std")]
+pub mod sync;
 
-cfg_if! {
-    if #[cfg(feature = "std")] {
-        pub mod sync;
-
-        #[cfg(not(crossbeam_loom))]
-        pub mod thread;
-    }
-}
+#[cfg(feature = "std")]
+#[cfg(not(crossbeam_loom))]
+pub mod thread;

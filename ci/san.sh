@@ -1,51 +1,35 @@
 #!/bin/bash
-
+set -euxo pipefail
+IFS=$'\n\t'
 cd "$(dirname "$0")"/..
-set -ex
 
-if [[ "$OSTYPE" != "linux"* ]]; then
-    exit 0
+if [[ "${OSTYPE}" != "linux"* ]]; then
+  exit 0
 fi
 
-rustup component add rust-src
+export RUSTFLAGS="${RUSTFLAGS:-} --cfg crossbeam_sanitize"
 
 # Run address sanitizer
 # TODO: Once `cfg(sanitize = "..")` is stable, replace
 # `cfg(crossbeam_sanitize)` with `cfg(sanitize = "..")` and remove
 # `--cfg crossbeam_sanitize`.
 cargo clean
-RUSTFLAGS="-Dwarnings -Zsanitizer=address --cfg crossbeam_sanitize" \
-cargo test --all --release --target x86_64-unknown-linux-gnu --tests \
-    --exclude crossbeam-skiplist --exclude benchmarks -- --test-threads=1
+ASAN_OPTIONS="${ASAN_OPTIONS:-} detect_stack_use_after_return=1" \
+  cargo test --all --all-features --release --target x86_64-unknown-linux-gnuasan --tests --exclude benchmarks -- --test-threads=1
 
-# There are memory leaks in crossbeam-skiplist.
-# https://github.com/crossbeam-rs/crossbeam/issues/614
-cargo clean
-RUSTFLAGS="-Dwarnings -Zsanitizer=address --cfg crossbeam_sanitize" \
-cargo test --release --target x86_64-unknown-linux-gnu \
-    -p crossbeam-skiplist --test map --test set
-cargo clean
-ASAN_OPTIONS="detect_leaks=0" \
-RUSTFLAGS="-Dwarnings -Zsanitizer=address --cfg crossbeam_sanitize" \
-cargo test --release --target x86_64-unknown-linux-gnu \
-    -p crossbeam-skiplist --tests
-
-cargo clean
-RUSTFLAGS="-Dwarnings -Zsanitizer=address --cfg crossbeam_sanitize" \
-cargo run \
-    --release \
-    --target x86_64-unknown-linux-gnu \
-    --features nightly \
-    --example sanitize \
-    --manifest-path crossbeam-epoch/Cargo.toml
+ASAN_OPTIONS="${ASAN_OPTIONS:-} detect_stack_use_after_return=1" \
+  cargo run \
+  --all-features \
+  --release \
+  --target x86_64-unknown-linux-gnuasan \
+  --example sanitize \
+  --manifest-path crossbeam-epoch/Cargo.toml
 
 # Run memory sanitizer
 cargo clean
-RUSTFLAGS="-Dwarnings -Zsanitizer=memory --cfg crossbeam_sanitize" \
-cargo test -Zbuild-std --all --release --target x86_64-unknown-linux-gnu --tests --exclude benchmarks -- --test-threads=1
+cargo test -Z build-std --all --all-features --release --target x86_64-unknown-linux-gnumsan --tests --exclude benchmarks -- --test-threads=1
 
 # Run thread sanitizer
-export TSAN_OPTIONS="suppressions=$(pwd)/ci/tsan"
 cargo clean
-RUSTFLAGS="-Dwarnings -Zsanitizer=thread --cfg crossbeam_sanitize" \
-cargo test -Zbuild-std --all --release --target x86_64-unknown-linux-gnu --tests --exclude benchmarks -- --test-threads=1
+TSAN_OPTIONS="${TSAN_OPTIONS:-} suppressions=$(pwd)/ci/tsan" \
+  cargo test -Z build-std --all --all-features --release --target x86_64-unknown-linux-gnutsan --tests --exclude benchmarks -- --test-threads=1

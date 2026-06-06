@@ -1,16 +1,17 @@
 //! Tests for the list channel flavor.
 
-use std::any::Any;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-use std::thread;
-use std::time::Duration;
+use std::{
+    any::Any,
+    sync::atomic::{AtomicUsize, Ordering},
+    thread,
+    time::Duration,
+};
 
-use crossbeam_channel::{select, unbounded, Receiver};
-use crossbeam_channel::{RecvError, RecvTimeoutError, TryRecvError};
-use crossbeam_channel::{SendError, SendTimeoutError, TrySendError};
+use crossbeam_channel::{
+    Receiver, RecvError, RecvTimeoutError, SendError, SendTimeoutError, TryRecvError, TrySendError,
+    select, unbounded,
+};
 use crossbeam_utils::thread::scope;
-use rand::{thread_rng, Rng};
 
 fn ms(ms: u64) -> Duration {
     Duration::from_millis(ms)
@@ -67,6 +68,7 @@ fn len_empty_full() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)] // this test makes timing assumptions, but Miri is so slow it violates them
 fn try_recv() {
     let (s, r) = unbounded();
 
@@ -132,8 +134,10 @@ fn recv_timeout() {
 
 #[test]
 fn try_send() {
+    const COUNT: usize = if cfg!(miri) { 50 } else { 1000 };
+
     let (s, r) = unbounded();
-    for i in 0..1000 {
+    for i in 0..COUNT {
         assert_eq!(s.try_send(i), Ok(()));
     }
 
@@ -143,8 +147,10 @@ fn try_send() {
 
 #[test]
 fn send() {
+    const COUNT: usize = if cfg!(miri) { 50 } else { 1000 };
+
     let (s, r) = unbounded();
-    for i in 0..1000 {
+    for i in 0..COUNT {
         assert_eq!(s.send(i), Ok(()));
     }
 
@@ -154,8 +160,10 @@ fn send() {
 
 #[test]
 fn send_timeout() {
+    const COUNT: usize = if cfg!(miri) { 50 } else { 1000 };
+
     let (s, r) = unbounded();
-    for i in 0..1000 {
+    for i in 0..COUNT {
         assert_eq!(s.send_timeout(i, ms(i as u64)), Ok(()));
     }
 
@@ -239,7 +247,7 @@ fn disconnect_wakes_receiver() {
 
 #[test]
 fn spsc() {
-    const COUNT: usize = 100_000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 100_000 };
 
     let (s, r) = unbounded();
 
@@ -261,7 +269,7 @@ fn spsc() {
 
 #[test]
 fn mpmc() {
-    const COUNT: usize = 25_000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 25_000 };
     const THREADS: usize = 4;
 
     let (s, r) = unbounded::<usize>();
@@ -295,7 +303,7 @@ fn mpmc() {
 
 #[test]
 fn stress_oneshot() {
-    const COUNT: usize = 10_000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 10_000 };
 
     for _ in 0..COUNT {
         let (s, r) = unbounded();
@@ -310,7 +318,7 @@ fn stress_oneshot() {
 
 #[test]
 fn stress_iter() {
-    const COUNT: usize = 100_000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 100_000 };
 
     let (request_s, request_r) = unbounded();
     let (response_s, response_r) = unbounded();
@@ -373,6 +381,9 @@ fn stress_timeout_two_threads() {
 
 #[test]
 fn drops() {
+    const RUNS: usize = if cfg!(miri) { 20 } else { 100 };
+    const STEPS: usize = if cfg!(miri) { 100 } else { 10_000 };
+
     static DROPS: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Debug, PartialEq)]
@@ -384,11 +395,11 @@ fn drops() {
         }
     }
 
-    let mut rng = thread_rng();
+    let mut rng = fastrand::Rng::new();
 
-    for _ in 0..100 {
-        let steps = rng.gen_range(0..10_000);
-        let additional = rng.gen_range(0..1000);
+    for _ in 0..RUNS {
+        let steps = rng.usize(0..STEPS);
+        let additional = rng.usize(0..STEPS / 10);
 
         DROPS.store(0, Ordering::SeqCst);
         let (s, r) = unbounded::<DropCounter>();
@@ -421,7 +432,7 @@ fn drops() {
 
 #[test]
 fn linearizable() {
-    const COUNT: usize = 25_000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 25_000 };
     const THREADS: usize = 4;
 
     let (s, r) = unbounded();
@@ -441,7 +452,7 @@ fn linearizable() {
 
 #[test]
 fn fairness() {
-    const COUNT: usize = 10_000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 10_000 };
 
     let (s1, r1) = unbounded::<()>();
     let (s2, r2) = unbounded::<()>();
@@ -463,7 +474,7 @@ fn fairness() {
 
 #[test]
 fn fairness_duplicates() {
-    const COUNT: usize = 10_000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 10_000 };
 
     let (s, r) = unbounded();
 
@@ -496,7 +507,7 @@ fn recv_in_send() {
 
 #[test]
 fn channel_through_channel() {
-    const COUNT: usize = 1000;
+    const COUNT: usize = if cfg!(miri) { 100 } else { 1000 };
 
     type T = Box<dyn Any + Send>;
 
@@ -530,4 +541,19 @@ fn channel_through_channel() {
         });
     })
     .unwrap();
+}
+
+// If `Block` is created on the stack, the array of slots will multiply this `BigStruct` and
+// probably overflow the thread stack. It's now directly created on the heap to avoid this.
+#[test]
+fn stack_overflow() {
+    const N: usize = 32_768;
+    struct BigStruct {
+        _data: [u8; N],
+    }
+
+    let (sender, receiver) = unbounded::<BigStruct>();
+    sender.send(BigStruct { _data: [0u8; N] }).unwrap();
+
+    for _data in receiver.try_iter() {}
 }

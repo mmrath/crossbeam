@@ -1,61 +1,76 @@
-use std::mem;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::SeqCst;
+use std::{
+    mem,
+    sync::atomic::{AtomicUsize, Ordering::SeqCst},
+};
 
 use crossbeam_utils::atomic::AtomicCell;
 
+// Always use fallback for now on environments that do not support inline assembly.
+fn always_use_fallback() -> bool {
+    atomic_maybe_uninit::cfg_has_atomic_cas! {
+        cfg!(any(
+            miri,
+            crossbeam_loom,
+            crossbeam_atomic_cell_force_fallback,
+        ))
+    }
+    atomic_maybe_uninit::cfg_no_atomic_cas! { true }
+}
+
 #[test]
 fn is_lock_free() {
-    struct UsizeWrap(usize);
-    struct U8Wrap(bool);
-    struct I16Wrap(i16);
-    #[repr(align(8))]
-    struct U64Align8(u64);
+    let always_use_fallback = always_use_fallback();
 
-    assert!(AtomicCell::<usize>::is_lock_free());
-    assert!(AtomicCell::<isize>::is_lock_free());
-    assert!(AtomicCell::<UsizeWrap>::is_lock_free());
+    struct UsizeWrap(#[allow(dead_code)] usize);
+    struct U8Wrap(#[allow(dead_code)] bool);
+    struct I16Wrap(#[allow(dead_code)] i16);
+    #[repr(align(8))]
+    struct U64Align8(#[allow(dead_code)] u64);
+
+    assert_eq!(AtomicCell::<usize>::is_lock_free(), !always_use_fallback);
+    assert_eq!(AtomicCell::<isize>::is_lock_free(), !always_use_fallback);
+    assert_eq!(
+        AtomicCell::<UsizeWrap>::is_lock_free(),
+        !always_use_fallback
+    );
 
     assert!(AtomicCell::<()>::is_lock_free());
 
-    assert!(AtomicCell::<u8>::is_lock_free());
-    assert!(AtomicCell::<i8>::is_lock_free());
-    assert!(AtomicCell::<bool>::is_lock_free());
-    assert!(AtomicCell::<U8Wrap>::is_lock_free());
+    assert_eq!(AtomicCell::<u8>::is_lock_free(), !always_use_fallback);
+    assert_eq!(AtomicCell::<i8>::is_lock_free(), !always_use_fallback);
+    assert_eq!(AtomicCell::<bool>::is_lock_free(), !always_use_fallback);
+    assert_eq!(AtomicCell::<U8Wrap>::is_lock_free(), !always_use_fallback);
 
-    assert!(AtomicCell::<u16>::is_lock_free());
-    assert!(AtomicCell::<i16>::is_lock_free());
-    assert!(AtomicCell::<I16Wrap>::is_lock_free());
+    assert_eq!(AtomicCell::<u16>::is_lock_free(), !always_use_fallback);
+    assert_eq!(AtomicCell::<i16>::is_lock_free(), !always_use_fallback);
+    assert_eq!(AtomicCell::<I16Wrap>::is_lock_free(), !always_use_fallback);
 
-    assert!(AtomicCell::<u32>::is_lock_free());
-    assert!(AtomicCell::<i32>::is_lock_free());
+    assert_eq!(AtomicCell::<u32>::is_lock_free(), !always_use_fallback);
+    assert_eq!(AtomicCell::<i32>::is_lock_free(), !always_use_fallback);
 
     // Sizes of both types must be equal, and the alignment of `u64` must be greater or equal than
     // that of `AtomicU64`. In i686-unknown-linux-gnu, the alignment of `u64` is `4` and alignment
     // of `AtomicU64` is `8`, so `AtomicCell<u64>` is not lock-free.
     assert_eq!(
         AtomicCell::<u64>::is_lock_free(),
-        cfg!(not(crossbeam_no_atomic_64))
-            && cfg!(any(
-                target_pointer_width = "64",
-                target_pointer_width = "128"
-            ))
+        cfg!(target_has_atomic = "64") && mem::align_of::<u64>() == 8 && !always_use_fallback
     );
     assert_eq!(mem::size_of::<U64Align8>(), 8);
     assert_eq!(mem::align_of::<U64Align8>(), 8);
     assert_eq!(
         AtomicCell::<U64Align8>::is_lock_free(),
-        cfg!(not(crossbeam_no_atomic_64))
+        cfg!(target_has_atomic = "64") && !always_use_fallback
     );
 
-    // AtomicU128 is unstable
-    assert!(!AtomicCell::<u128>::is_lock_free());
-}
-
-#[test]
-fn const_is_lock_free() {
-    const _U: bool = AtomicCell::<usize>::is_lock_free();
-    const _I: bool = AtomicCell::<isize>::is_lock_free();
+    atomic_maybe_uninit::cfg_has_atomic_128! {
+        assert_eq!(
+            AtomicCell::<u128>::is_lock_free(),
+            mem::align_of::<u128>() == 16 && !always_use_fallback
+        );
+    };
+    atomic_maybe_uninit::cfg_no_atomic_128! {
+        assert!(!AtomicCell::<u128>::is_lock_free());
+    };
 }
 
 #[test]
@@ -67,9 +82,9 @@ fn drops_unit() {
     struct Foo();
 
     impl Foo {
-        fn new() -> Foo {
+        fn new() -> Self {
             CNT.fetch_add(1, SeqCst);
-            Foo()
+            Self()
         }
     }
 
@@ -80,8 +95,8 @@ fn drops_unit() {
     }
 
     impl Default for Foo {
-        fn default() -> Foo {
-            Foo::new()
+        fn default() -> Self {
+            Self::new()
         }
     }
 
@@ -109,9 +124,9 @@ fn drops_u8() {
     struct Foo(u8);
 
     impl Foo {
-        fn new(val: u8) -> Foo {
+        fn new(val: u8) -> Self {
             CNT.fetch_add(1, SeqCst);
-            Foo(val)
+            Self(val)
         }
     }
 
@@ -122,8 +137,8 @@ fn drops_u8() {
     }
 
     impl Default for Foo {
-        fn default() -> Foo {
-            Foo::new(0)
+        fn default() -> Self {
+            Self::new(0)
         }
     }
 
@@ -155,9 +170,9 @@ fn drops_usize() {
     struct Foo(usize);
 
     impl Foo {
-        fn new(val: usize) -> Foo {
+        fn new(val: usize) -> Self {
             CNT.fetch_add(1, SeqCst);
-            Foo(val)
+            Self(val)
         }
     }
 
@@ -168,8 +183,8 @@ fn drops_usize() {
     }
 
     impl Default for Foo {
-        fn default() -> Foo {
-            Foo::new(0)
+        fn default() -> Self {
+            Self::new(0)
         }
     }
 
@@ -198,7 +213,7 @@ fn modular_u8() {
     struct Foo(u8);
 
     impl PartialEq for Foo {
-        fn eq(&self, other: &Foo) -> bool {
+        fn eq(&self, other: &Self) -> bool {
             self.0 % 5 == other.0 % 5
         }
     }
@@ -222,7 +237,7 @@ fn modular_usize() {
     struct Foo(usize);
 
     impl PartialEq for Foo {
-        fn eq(&self, other: &Foo) -> bool {
+        fn eq(&self, other: &Self) -> bool {
             self.0 % 5 == other.0 % 5
         }
     }
@@ -258,9 +273,132 @@ fn garbage_padding() {
 }
 
 #[test]
-fn const_atomic_cell_new() {
+fn const_atomic_cell() {
+    const _IS_LOCK_FREE_U: bool = AtomicCell::<usize>::is_lock_free();
+    const _IS_LOCK_FREE_I: bool = AtomicCell::<isize>::is_lock_free();
+    static INTO_INNER: usize = {
+        let v = AtomicCell::new(!0);
+        v.into_inner()
+    };
+    #[rustversion::since(1.83)]
+    static _AS_PTR: AtomicCell<usize> = {
+        let v = AtomicCell::new(!0);
+        let _p = v.as_ptr();
+        v
+    };
     static CELL: AtomicCell<usize> = AtomicCell::new(0);
 
     CELL.store(1);
     assert_eq!(CELL.load(), 1);
+    assert_eq!(INTO_INNER, !0);
+}
+
+// https://github.com/crossbeam-rs/crossbeam/pull/767
+macro_rules! test_arithmetic {
+    ($test_name:ident, $ty:ident) => {
+        #[test]
+        fn $test_name() {
+            let a: AtomicCell<$ty> = AtomicCell::new(7);
+
+            assert_eq!(a.fetch_add(3), 7);
+            assert_eq!(a.load(), 10);
+
+            assert_eq!(a.fetch_sub(3), 10);
+            assert_eq!(a.load(), 7);
+
+            assert_eq!(a.fetch_and(3), 7);
+            assert_eq!(a.load(), 3);
+
+            assert_eq!(a.fetch_or(16), 3);
+            assert_eq!(a.load(), 19);
+
+            assert_eq!(a.fetch_xor(2), 19);
+            assert_eq!(a.load(), 17);
+
+            assert_eq!(a.fetch_max(18), 17);
+            assert_eq!(a.load(), 18);
+
+            assert_eq!(a.fetch_min(17), 18);
+            assert_eq!(a.load(), 17);
+
+            assert_eq!(a.fetch_nand(7), 17);
+            assert_eq!(a.load(), !(17 & 7));
+        }
+    };
+}
+test_arithmetic!(arithmetic_u8, u8);
+test_arithmetic!(arithmetic_i8, i8);
+test_arithmetic!(arithmetic_u16, u16);
+test_arithmetic!(arithmetic_i16, i16);
+test_arithmetic!(arithmetic_u32, u32);
+test_arithmetic!(arithmetic_i32, i32);
+test_arithmetic!(arithmetic_u64, u64);
+test_arithmetic!(arithmetic_i64, i64);
+test_arithmetic!(arithmetic_u128, u128);
+test_arithmetic!(arithmetic_i128, i128);
+
+// https://github.com/crossbeam-rs/crossbeam/issues/748
+#[test]
+fn issue_748() {
+    #[allow(dead_code)]
+    #[repr(align(8))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Test {
+        Field(u32),
+        FieldLess,
+    }
+
+    assert_eq!(mem::size_of::<Test>(), 8);
+    assert_eq!(
+        AtomicCell::<Test>::is_lock_free(),
+        cfg!(target_has_atomic = "64") && !always_use_fallback()
+    );
+    let x = AtomicCell::new(Test::FieldLess);
+    assert_eq!(x.load(), Test::FieldLess);
+}
+
+// https://github.com/crossbeam-rs/crossbeam/issues/833
+#[test]
+fn issue_833() {
+    use std::{
+        num::NonZeroU128,
+        sync::atomic::{AtomicBool, Ordering},
+        thread,
+    };
+
+    const N: usize = if cfg!(miri) { 10_000 } else { 1_000_000 };
+
+    #[allow(dead_code)]
+    enum Enum {
+        NeverConstructed,
+        Cell(AtomicCell<NonZeroU128>),
+    }
+
+    static STATIC: Enum = Enum::Cell(AtomicCell::new(match NonZeroU128::new(1) {
+        Some(nonzero) => nonzero,
+        None => unreachable!(),
+    }));
+    static FINISHED: AtomicBool = AtomicBool::new(false);
+
+    let handle = thread::spawn(|| {
+        let cell = match &STATIC {
+            Enum::NeverConstructed => unreachable!(),
+            Enum::Cell(cell) => cell,
+        };
+        let x = NonZeroU128::new(0xFFFF_FFFF_FFFF_FFFF_0000_0000_0000_0000).unwrap();
+        let y = NonZeroU128::new(0x0000_0000_0000_0000_FFFF_FFFF_FFFF_FFFF).unwrap();
+        while !FINISHED.load(Ordering::Relaxed) {
+            cell.store(x);
+            cell.store(y);
+        }
+    });
+
+    for _ in 0..N {
+        if let Enum::NeverConstructed = STATIC {
+            unreachable!(":(");
+        }
+    }
+
+    FINISHED.store(true, Ordering::Relaxed);
+    handle.join().unwrap(); // join thread to avoid https://github.com/rust-lang/miri/issues/1371
 }

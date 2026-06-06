@@ -1,7 +1,9 @@
-use std::any::Any;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread::sleep;
-use std::time::Duration;
+use std::{
+    any::Any,
+    sync::atomic::{AtomicUsize, Ordering},
+    thread::sleep,
+    time::Duration,
+};
 
 use crossbeam_utils::thread;
 
@@ -187,7 +189,7 @@ fn scope_returns_ok() {
 #[cfg(unix)]
 #[test]
 fn as_pthread_t() {
-    use std::os::unix::thread::JoinHandleExt;
+    use thread::unix::JoinHandleExt;
     thread::scope(|scope| {
         let handle = scope.spawn(|_scope| {
             sleep(Duration::from_millis(100));

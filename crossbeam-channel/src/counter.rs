@@ -1,9 +1,12 @@
 //! Reference counter for channels.
 
-use std::isize;
-use std::ops;
+use alloc::boxed::Box;
+use core::{
+    ops,
+    ptr::NonNull,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use std::process;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Reference counter internals.
 struct Counter<C> {
@@ -22,12 +25,12 @@ struct Counter<C> {
 
 /// Wraps a channel into the reference counter.
 pub(crate) fn new<C>(chan: C) -> (Sender<C>, Receiver<C>) {
-    let counter = Box::into_raw(Box::new(Counter {
+    let counter = NonNull::from(Box::leak(Box::new(Counter {
         senders: AtomicUsize::new(1),
         receivers: AtomicUsize::new(1),
         destroy: AtomicBool::new(false),
         chan,
-    }));
+    })));
     let s = Sender { counter };
     let r = Receiver { counter };
     (s, r)
@@ -35,17 +38,17 @@ pub(crate) fn new<C>(chan: C) -> (Sender<C>, Receiver<C>) {
 
 /// The sending side.
 pub(crate) struct Sender<C> {
-    counter: *mut Counter<C>,
+    counter: NonNull<Counter<C>>,
 }
 
 impl<C> Sender<C> {
     /// Returns the internal `Counter`.
     fn counter(&self) -> &Counter<C> {
-        unsafe { &*self.counter }
+        unsafe { self.counter.as_ref() }
     }
 
     /// Acquires another sender reference.
-    pub(crate) fn acquire(&self) -> Sender<C> {
+    pub(crate) fn acquire(&self) -> Self {
         let count = self.counter().senders.fetch_add(1, Ordering::Relaxed);
 
         // Cloning senders and calling `mem::forget` on the clones could potentially overflow the
@@ -55,7 +58,7 @@ impl<C> Sender<C> {
             process::abort();
         }
 
-        Sender {
+        Self {
             counter: self.counter,
         }
     }
@@ -68,9 +71,13 @@ impl<C> Sender<C> {
             disconnect(&self.counter().chan);
 
             if self.counter().destroy.swap(true, Ordering::AcqRel) {
-                drop(Box::from_raw(self.counter));
+                drop(unsafe { Box::from_raw(self.counter.as_ptr()) });
             }
         }
+    }
+
+    pub(crate) fn addr(&self) -> usize {
+        self.counter.as_ptr() as usize
     }
 }
 
@@ -83,24 +90,24 @@ impl<C> ops::Deref for Sender<C> {
 }
 
 impl<C> PartialEq for Sender<C> {
-    fn eq(&self, other: &Sender<C>) -> bool {
+    fn eq(&self, other: &Self) -> bool {
         self.counter == other.counter
     }
 }
 
 /// The receiving side.
 pub(crate) struct Receiver<C> {
-    counter: *mut Counter<C>,
+    counter: NonNull<Counter<C>>,
 }
 
 impl<C> Receiver<C> {
     /// Returns the internal `Counter`.
     fn counter(&self) -> &Counter<C> {
-        unsafe { &*self.counter }
+        unsafe { self.counter.as_ref() }
     }
 
     /// Acquires another receiver reference.
-    pub(crate) fn acquire(&self) -> Receiver<C> {
+    pub(crate) fn acquire(&self) -> Self {
         let count = self.counter().receivers.fetch_add(1, Ordering::Relaxed);
 
         // Cloning receivers and calling `mem::forget` on the clones could potentially overflow the
@@ -110,7 +117,7 @@ impl<C> Receiver<C> {
             process::abort();
         }
 
-        Receiver {
+        Self {
             counter: self.counter,
         }
     }
@@ -123,9 +130,13 @@ impl<C> Receiver<C> {
             disconnect(&self.counter().chan);
 
             if self.counter().destroy.swap(true, Ordering::AcqRel) {
-                drop(Box::from_raw(self.counter));
+                drop(unsafe { Box::from_raw(self.counter.as_ptr()) });
             }
         }
+    }
+
+    pub(crate) fn addr(&self) -> usize {
+        self.counter.as_ptr() as usize
     }
 }
 
@@ -138,7 +149,7 @@ impl<C> ops::Deref for Receiver<C> {
 }
 
 impl<C> PartialEq for Receiver<C> {
-    fn eq(&self, other: &Receiver<C>) -> bool {
+    fn eq(&self, other: &Self) -> bool {
         self.counter == other.counter
     }
 }
